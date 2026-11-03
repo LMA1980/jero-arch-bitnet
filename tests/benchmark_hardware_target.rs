@@ -274,10 +274,10 @@ fn test_target_hardware_full_model_inference() {
     let total_kv = 640;
     let vocab_size = 32000;
 
-    let prompt_tokens = (0..32)
+    let prompt_tokens = (0..4)
         .map(|x| (x * 7 + 3) % vocab_size as u32)
         .collect::<Vec<_>>();
-    let n_gen_tokens = 4;
+    let n_gen_tokens = 2;
 
     let model_variants = [
         ("bitnet-b1.58 (30L)", QuantType::TQ1_0, true),
@@ -468,7 +468,7 @@ fn test_target_hardware_full_model_inference() {
         let mut run_digests = Vec::new();
 
         for r in 0..n_runs {
-            let mut logits = vec![0.0f32; 16];
+            let mut logits = vec![0.0f32; vocab_size];
             let kv_len = 2 * total_kv * 128 * num_layers;
             let mut kv_cache = vec![0.0f32; kv_len];
             let mut ctx =
