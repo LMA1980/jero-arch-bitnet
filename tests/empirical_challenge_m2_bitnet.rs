@@ -830,3 +830,508 @@ fn test_bitnet_subln_and_recipe() {
     assert!(logits_swiglu.iter().all(|x| x.is_finite()));
     assert_ne!(logits_relu, logits_swiglu);
 }
+
+/// Suite 5: Empirical verification of SubLN weight sensitivity across all 7 projections.
+#[test]
+fn test_empirical_subln_weight_sensitivity_across_7_projections() {
+    let hidden_dim = 256;
+    let ffn_dim = 512;
+    let total_q = 256;
+    let total_kv = 128;
+    let eps = 1e-5;
+
+    // 1. Direct kernel-level sensitivity for each of the 7 projection stages:
+    let projections = [
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_output",
+        "ffn_gate",
+        "ffn_up",
+        "ffn_down",
+    ];
+    for proj_name in &projections {
+        let (dim, out_dim) = match *proj_name {
+            "attn_q" | "attn_k" | "attn_v" | "ffn_gate" | "ffn_up" => (hidden_dim, 64),
+            "attn_output" => (total_q, hidden_dim),
+            "ffn_down" => (ffn_dim, hidden_dim),
+            _ => unreachable!(),
+        };
+
+        let input: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.05 + 1.0).collect();
+        let w_norm_base = vec![1.0f32; dim];
+        let mut w_norm_mutated = vec![1.0f32; dim];
+        for i in 0..dim {
+            w_norm_mutated[i] = 1.0 + (i as f32 + 1.0) * 0.01;
+        }
+
+        let mut act_base = vec![0i8; dim];
+        let mut act_mutated = vec![0i8; dim];
+
+        let scale_base = subln_quantize_absmax_i8(&mut act_base, &input, &w_norm_base, eps)
+            .expect("subln base succeeds");
+        let scale_mutated =
+            subln_quantize_absmax_i8(&mut act_mutated, &input, &w_norm_mutated, eps)
+                .expect("subln mutated succeeds");
+
+        assert_ne!(
+            scale_base, scale_mutated,
+            "Scale must change on SubLN mutation for {proj_name}"
+        );
+        assert_ne!(
+            act_base, act_mutated,
+            "Quantized activations must change for {proj_name}"
+        );
+
+        let raw_tq1 = create_synthetic_tq1_0_raw(out_dim, dim, 1);
+        let shape = [dim, out_dim];
+        let view = TensorView::from_bytes("w", QuantType::TQ1_0, &shape, 0, &raw_tq1).unwrap();
+
+        let mut proj_out_base = vec![0.0f32; out_dim];
+        let mut proj_out_mutated = vec![0.0f32; out_dim];
+
+        bitlinear_i8_rvv(&mut proj_out_base, &view, &act_base, scale_base).unwrap();
+        bitlinear_i8_rvv(&mut proj_out_mutated, &view, &act_mutated, scale_mutated).unwrap();
+
+        let l2_diff: f32 = proj_out_base
+            .iter()
+            .zip(&proj_out_mutated)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum();
+        println!(
+            "[PROJECTION SENSITIVITY] {proj_name:12} | base_scale={scale_base:.6} mut_scale={scale_mutated:.6} | act_diff_elems={} | out_l2_diff={l2_diff:.6}",
+            act_base
+                .iter()
+                .zip(&act_mutated)
+                .filter(|(a, b)| a != b)
+                .count()
+        );
+        assert!(
+            l2_diff > 1e-3,
+            "Projection output {proj_name} must have non-zero delta; got l2={l2_diff}"
+        );
+    }
+
+    // 2. End-to-end recipe sensitivity across all 4 SubLN weight tensors:
+    let recipe = BitNetRecipe {
+        architecture: "bitnet",
+        num_layers: 1,
+        hidden_dim,
+        ffn_dim,
+        n_heads_q: 4,
+        n_heads_kv: 2,
+        head_dim: 64,
+        vocab_size: 1024,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+
+    let prompt = [7u32, 19u32];
+
+    let run_model = |weights: &SyntheticBitNetWeights| -> Vec<f32> {
+        let mut logits = vec![0.0f32; 16];
+        let mut kv = vec![0.0f32; 1024];
+        let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+        recipe.prefill_step(&mut ctx, weights).unwrap();
+        logits
+    };
+
+    let weights_base =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+    let logits_base = run_model(&weights_base);
+
+    // Mutate attn_sub_norm with channel-dependent gradient (affects attn_q, attn_k, attn_v)
+    let mut w_attn_sub =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+    let mut attn_sub_raw = vec![0u8; hidden_dim * 4];
+    for i in 0..hidden_dim {
+        let val = 1.0 + (i as f32) * 0.05;
+        attn_sub_raw[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+    }
+    w_attn_sub.insert_tensor(
+        "blk.0.attn_sub_norm.weight",
+        QuantType::F32,
+        vec![hidden_dim],
+        attn_sub_raw,
+    );
+    let logits_attn_sub = run_model(&w_attn_sub);
+    assert_ne!(
+        logits_base, logits_attn_sub,
+        "Mutating attn_sub_norm must change logits"
+    );
+
+    // Mutate attn_output_sub_norm (affects attn_output)
+    let mut w_attn_out =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+    let mut attn_out_raw = vec![0u8; total_q * 4];
+    for i in 0..total_q {
+        let val = 1.0 + (i as f32) * 0.03;
+        attn_out_raw[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+    }
+    w_attn_out.insert_tensor(
+        "blk.0.attn_output_sub_norm.weight",
+        QuantType::F32,
+        vec![total_q],
+        attn_out_raw,
+    );
+    let logits_attn_out = run_model(&w_attn_out);
+    assert_ne!(
+        logits_base, logits_attn_out,
+        "Mutating attn_output_sub_norm must change logits"
+    );
+    assert_ne!(
+        logits_attn_sub, logits_attn_out,
+        "Distinct SubLN mutations must produce distinct logits"
+    );
+
+    // Mutate ffn_sub_norm with channel-dependent gradient (affects ffn_gate, ffn_up)
+    let mut w_ffn_sub =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+    let mut ffn_sub_raw = vec![0u8; hidden_dim * 4];
+    for i in 0..hidden_dim {
+        let val = 1.0 + (i as f32) * 0.04;
+        ffn_sub_raw[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+    }
+    w_ffn_sub.insert_tensor(
+        "blk.0.ffn_sub_norm.weight",
+        QuantType::F32,
+        vec![hidden_dim],
+        ffn_sub_raw,
+    );
+    let logits_ffn_sub = run_model(&w_ffn_sub);
+    assert_ne!(
+        logits_base, logits_ffn_sub,
+        "Mutating ffn_sub_norm must change logits"
+    );
+    assert_ne!(logits_attn_sub, logits_ffn_sub);
+    assert_ne!(logits_attn_out, logits_ffn_sub);
+
+    // Mutate ffn_down_sub_norm (affects ffn_down)
+    let mut w_ffn_down =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+    w_ffn_down.insert_tensor(
+        "blk.0.ffn_down_sub_norm.weight",
+        QuantType::F32,
+        vec![ffn_dim],
+        create_synthetic_f32_raw(ffn_dim, 0.25),
+    );
+    let logits_ffn_down = run_model(&w_ffn_down);
+    assert_ne!(
+        logits_base, logits_ffn_down,
+        "Mutating ffn_down_sub_norm must change logits"
+    );
+    let l2 = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum() };
+    println!(
+        "[RECIPE SENSITIVITY] attn_sub_norm delta L2 = {:.6e}",
+        l2(&logits_base, &logits_attn_sub)
+    );
+    println!(
+        "[RECIPE SENSITIVITY] attn_output_sub_norm delta L2 = {:.6e}",
+        l2(&logits_base, &logits_attn_out)
+    );
+    println!(
+        "[RECIPE SENSITIVITY] ffn_sub_norm delta L2 = {:.6e}",
+        l2(&logits_base, &logits_ffn_sub)
+    );
+    println!(
+        "[RECIPE SENSITIVITY] ffn_down_sub_norm delta L2 = {:.6e}",
+        l2(&logits_base, &logits_ffn_down)
+    );
+
+    assert_ne!(logits_attn_sub, logits_ffn_down);
+    assert_ne!(logits_attn_out, logits_ffn_down);
+    assert_ne!(logits_ffn_sub, logits_ffn_down);
+}
+
+/// Suite 6: Empirical verification of missing SubLN and projection weight fail-closed behavior.
+#[test]
+fn test_empirical_missing_subln_and_projection_weights_fail_closed() {
+    let hidden_dim = 256;
+    let ffn_dim = 512;
+    let total_q = 256;
+    let total_kv = 128;
+
+    let recipe = BitNetRecipe {
+        architecture: "bitnet",
+        num_layers: 1,
+        hidden_dim,
+        ffn_dim,
+        n_heads_q: 4,
+        n_heads_kv: 2,
+        head_dim: 64,
+        vocab_size: 1024,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+
+    let prompt = [3u32, 5u32];
+
+    // Primary tensors to remove; for tensors with architecture fallbacks, fallback is also removed
+    let test_cases: [(&str, Option<&str>); 11] = [
+        ("blk.0.attn_sub_norm.weight", Some("blk.0.attn_norm.weight")),
+        (
+            "blk.0.attn_output_sub_norm.weight",
+            Some("blk.0.attn_sub_norm.weight"),
+        ),
+        ("blk.0.ffn_sub_norm.weight", Some("blk.0.ffn_norm.weight")),
+        (
+            "blk.0.ffn_down_sub_norm.weight",
+            Some("blk.0.ffn_sub_norm.weight"),
+        ),
+        ("blk.0.attn_q.weight", None),
+        ("blk.0.attn_k.weight", None),
+        ("blk.0.attn_v.weight", None),
+        ("blk.0.attn_output.weight", None),
+        ("blk.0.ffn_gate.weight", None),
+        ("blk.0.ffn_up.weight", None),
+        ("blk.0.ffn_down.weight", None),
+    ];
+
+    for (tensor_name, fallback_name) in test_cases {
+        let mut weights =
+            build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+        assert!(weights.tensor_data.remove(tensor_name).is_some());
+        if let Some(fb) = fallback_name {
+            weights.tensor_data.remove(fb);
+        }
+
+        let mut logits = vec![0.0f32; 16];
+        let mut kv = vec![0.0f32; 1024];
+        let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+
+        let err = recipe
+            .prefill_step(&mut ctx, &weights)
+            .expect_err(&format!("Missing {tensor_name} must fail closed"));
+        println!("[FAIL CLOSED CHECK] Missing {tensor_name:35} -> Rejected: {err:?}");
+        assert!(
+            matches!(err, K3Error::TensorBoundsError { .. }),
+            "Expected TensorBoundsError for missing {tensor_name}, got {err:?}"
+        );
+    }
+}
+
+/// Suite 7: Empirical verification of numerical robustness and int8 clamping across float extremes.
+#[test]
+fn test_empirical_numerical_extremes_and_clamping() {
+    let dim = 256;
+    let norm_weight = vec![1.0f32; dim];
+    let eps = 1e-5;
+
+    // 1. Extreme high magnitude (+10^4 and -10^4)
+    let mut input_high = vec![0.0f32; dim];
+    for i in 0..dim {
+        input_high[i] = if i % 2 == 0 { 1e4 } else { -1e4 };
+    }
+    let mut out_high = vec![0i8; dim];
+    let scale_high = subln_quantize_absmax_i8(&mut out_high, &input_high, &norm_weight, eps)
+        .expect("high magnitude subln succeeds");
+
+    println!(
+        "[NUMERICAL EXTREME] Input +/-1e4   | scale={scale_high:.6} min_act={} max_act={}",
+        out_high.iter().min().unwrap(),
+        out_high.iter().max().unwrap()
+    );
+    assert!(scale_high.is_finite());
+    assert!(scale_high > 0.0);
+    for &val in &out_high {
+        assert!(
+            val >= -127,
+            "Val {val} must be clamped within symmetric int8 [-127, 127]"
+        );
+    }
+    assert!(out_high.iter().any(|&x| x == 127));
+    assert!(out_high.iter().any(|&x| x == -127));
+
+    // 2. Extreme small magnitude (+10^-15 and -10^-15)
+    let mut input_small = vec![0.0f32; dim];
+    for i in 0..dim {
+        input_small[i] = if i % 2 == 0 { 1e-15 } else { -1e-15 };
+    }
+    let mut out_small = vec![0i8; dim];
+    let scale_small = subln_quantize_absmax_i8(&mut out_small, &input_small, &norm_weight, eps)
+        .expect("small magnitude subln succeeds");
+
+    println!(
+        "[NUMERICAL EXTREME] Input +/-1e-15 | scale={scale_small:.6} min_act={} max_act={}",
+        out_small.iter().min().unwrap(),
+        out_small.iter().max().unwrap()
+    );
+    assert!(scale_small.is_finite());
+    assert_eq!(scale_small, 1.0 / 127.0);
+    assert!(
+        out_small.iter().all(|&x| x == 0),
+        "Near-zero inputs must quantize to exactly 0"
+    );
+
+    // 3. Dynamic scaling range and strict int8 bounds on mixed range:
+    let mut input_mixed = vec![0.0f32; dim];
+    for i in 0..dim {
+        input_mixed[i] = ((i as f32) - 128.0) * 100.0;
+    }
+    let mut out_mixed = vec![0i8; dim];
+    let scale_mixed = subln_quantize_absmax_i8(&mut out_mixed, &input_mixed, &norm_weight, eps)
+        .expect("mixed subln succeeds");
+    assert!(scale_mixed > 0.0 && scale_mixed.is_finite());
+    for &val in &out_mixed {
+        assert!(val >= -127, "Val {val} exceeds [-127, 127]");
+    }
+
+    // 4. Ultra-extreme magnitudes (10^30 and 10^-30):
+    let input_huge = vec![1e30f32; dim];
+    let mut out_huge = vec![0i8; dim];
+    let res_huge = subln_quantize_absmax_i8(&mut out_huge, &input_huge, &norm_weight, eps);
+    assert!(res_huge.is_ok(), "Must not panic on 1e30");
+    let scale_huge = res_huge.unwrap();
+    assert!(scale_huge.is_finite());
+    for &val in &out_huge {
+        assert!(val >= -127);
+    }
+
+    // 5. Handling of NaN and Infinity inputs gracefully without panic:
+    let mut input_nan = vec![1.0f32; dim];
+    input_nan[10] = f32::NAN;
+    let mut out_nan = vec![0i8; dim];
+    let scale_nan = subln_quantize_absmax_i8(&mut out_nan, &input_nan, &norm_weight, eps)
+        .expect("NaN must be guarded cleanly");
+    assert!(scale_nan.is_finite());
+    assert_eq!(scale_nan, 1.0 / 127.0);
+    assert!(out_nan.iter().all(|&x| x == 0));
+
+    let mut input_inf = vec![1.0f32; dim];
+    input_inf[5] = f32::INFINITY;
+    let mut out_inf = vec![0i8; dim];
+    let scale_inf = subln_quantize_absmax_i8(&mut out_inf, &input_inf, &norm_weight, eps)
+        .expect("Inf must be guarded cleanly");
+    assert!(scale_inf.is_finite());
+    assert_eq!(scale_inf, 1.0 / 127.0);
+    assert!(out_inf.iter().all(|&x| x == 0));
+}
+
+/// Suite 8: Empirical verification of boundary inputs and invalid quantization rejection.
+#[test]
+fn test_empirical_boundary_inputs_and_invalid_quants() {
+    let hidden_dim = 256;
+    let ffn_dim = 512;
+    let total_q = 256;
+    let total_kv = 128;
+    let eps = 1e-5;
+
+    // 1. Zero hidden dimension in subln kernel:
+    let mut empty_out: [i8; 0] = [];
+    let empty_in: [f32; 0] = [];
+    let empty_w: [f32; 0] = [];
+    let err_empty = subln_quantize_absmax_i8(&mut empty_out, &empty_in, &empty_w, eps)
+        .expect_err("Empty input must return TensorBoundsError");
+    assert!(matches!(err_empty, K3Error::TensorBoundsError { .. }));
+
+    // Slice length mismatch:
+    let mut mismatched_out = vec![0i8; 128];
+    let in_256 = vec![1.0f32; 256];
+    let w_256 = vec![1.0f32; 256];
+    let err_mismatch = subln_quantize_absmax_i8(&mut mismatched_out, &in_256, &w_256, eps)
+        .expect_err("Length mismatch must return TensorBoundsError");
+    assert!(matches!(err_mismatch, K3Error::TensorBoundsError { .. }));
+
+    // 2. Zero hidden dimension in BitNetRecipe:
+    let recipe_zero = BitNetRecipe {
+        architecture: "bitnet",
+        num_layers: 1,
+        hidden_dim: 0,
+        ffn_dim: 0,
+        n_heads_q: 0,
+        n_heads_kv: 0,
+        head_dim: 0,
+        vocab_size: 1024,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+    // Should safely clamp dimensions without divide-by-zero or panic in synthetic mode
+    let empty_weights = SyntheticBitNetWeights::new();
+    let prompt = [1u32];
+    let mut logits = vec![0.0f32; 16];
+    let mut kv = vec![0.0f32; 1024];
+    let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+    let res = recipe_zero.prefill_step(&mut ctx, &empty_weights);
+    assert!(
+        res.is_ok(),
+        "Recipe with 0 dims should clamp to safe minimums"
+    );
+
+    // 3. Sequence length boundaries:
+    let recipe = BitNetRecipe {
+        architecture: "bitnet",
+        num_layers: 1,
+        hidden_dim,
+        ffn_dim,
+        n_heads_q: 4,
+        n_heads_kv: 2,
+        head_dim: 64,
+        vocab_size: 1024,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+    let weights =
+        build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+
+    // Empty prompt:
+    let empty_prompt: [u32; 0] = [];
+    let mut ctx_empty = ExecutionContext::new(&empty_prompt, 32, &mut logits, &mut kv).unwrap();
+    let err_empty_prompt = recipe
+        .prefill_step(&mut ctx_empty, &weights)
+        .expect_err("empty prompt");
+    assert!(matches!(
+        err_empty_prompt,
+        K3Error::ContextLengthExceeded { .. }
+    ));
+
+    // Unprepared decode:
+    let mut ctx_unprepared = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+    let err_unprep = recipe
+        .decode_step(&mut ctx_unprepared, &weights)
+        .expect_err("unprepared decode");
+    assert!(matches!(err_unprep, K3Error::CapabilityMismatch { .. }));
+
+    // 4. Invalid quantization types in weights:
+    let unsupported_quants = [QuantType::Q4_0, QuantType::Q4_K_M, QuantType::Q6_K];
+    for bad_quant in unsupported_quants {
+        assert!(!recipe.supports_quant(bad_quant));
+
+        // SubLN norm weight with unsupported quant
+        let mut bad_norm_weights =
+            build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+        bad_norm_weights.insert_tensor(
+            "blk.0.attn_sub_norm.weight",
+            bad_quant,
+            vec![hidden_dim],
+            vec![0u8; hidden_dim * 4],
+        );
+        let mut ctx_bad_norm = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+        let err_bad_norm = recipe
+            .prefill_step(&mut ctx_bad_norm, &bad_norm_weights)
+            .expect_err(&format!(
+                "Unsupported quant {bad_quant:?} for norm must fail"
+            ));
+        assert!(matches!(err_bad_norm, K3Error::TensorBoundsError { .. }));
+
+        // BitLinear projection weight with unsupported quant
+        let mut bad_proj_weights =
+            build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+        bad_proj_weights.insert_tensor(
+            "blk.0.attn_q.weight",
+            bad_quant,
+            vec![hidden_dim, total_q],
+            vec![0u8; hidden_dim * total_q],
+        );
+        let mut ctx_bad_proj = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+        let err_bad_proj = recipe
+            .prefill_step(&mut ctx_bad_proj, &bad_proj_weights)
+            .expect_err(&format!(
+                "Unsupported quant {bad_quant:?} for projection must fail"
+            ));
+        assert!(matches!(err_bad_proj, K3Error::TensorBoundsError { .. }));
+    }
+}
