@@ -1,0 +1,27 @@
+[package]
+name = "k3-arch-bitnet"
+description = "BitNet architecture recipe (bitnet, bitnet-b1.58, and bitnet-25) for the SpacemiT K3 platform"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
+repository = "https://github.com/LMA1980/k3-arch-bitnet"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[dependencies]
+k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "feat/m4-epic2-bitnet-tq1-tq2" }
+kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", branch = "feat/m4-epic2-bitnet-tq1-tq2", optional = true }
+
+[features]
+default = ["with-kernels"]
+with-kernels = ["dep:kernels-rvv"]
