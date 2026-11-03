@@ -104,10 +104,15 @@ impl ArchRecipe for BitNetRecipe {
     }
 
     fn supports_quant(&self, quant: QuantType) -> bool {
-        match quant {
-            QuantType::Q8_0 | QuantType::F32 | QuantType::F16 | QuantType::BF16 => true,
-            _ => quant.as_str() == "TQ1_0" || quant.as_str() == "TQ2_0",
-        }
+        matches!(
+            quant,
+            QuantType::TQ1_0
+                | QuantType::TQ2_0
+                | QuantType::Q8_0
+                | QuantType::F32
+                | QuantType::F16
+                | QuantType::BF16
+        )
     }
 
     fn prefill_step(
