@@ -1069,6 +1069,56 @@ fn test_empirical_subln_weight_sensitivity_across_7_projections() {
     assert_ne!(logits_attn_sub, logits_ffn_down);
     assert_ne!(logits_attn_out, logits_ffn_down);
     assert_ne!(logits_ffn_sub, logits_ffn_down);
+
+    // 3. End-to-end recipe sensitivity across all 7 projection weights:
+    let proj_tensors: [(&str, usize, usize); 7] = [
+        ("blk.0.attn_q.weight", hidden_dim, total_q),
+        ("blk.0.attn_k.weight", hidden_dim, total_kv),
+        ("blk.0.attn_v.weight", hidden_dim, total_kv),
+        ("blk.0.attn_output.weight", total_q, hidden_dim),
+        ("blk.0.ffn_gate.weight", hidden_dim, ffn_dim),
+        ("blk.0.ffn_up.weight", hidden_dim, ffn_dim),
+        ("blk.0.ffn_down.weight", ffn_dim, hidden_dim),
+    ];
+
+    for (tensor_name, in_dim, out_dim) in proj_tensors {
+        let mut w_mut =
+            build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+        let inverted_pattern =
+            create_synthetic_tq1_0_pattern(out_dim, in_dim, |r, c| match tensor_name {
+                "blk.0.attn_q.weight" => -((((r * 7 + c * 11 + 1) % 3) as i8) - 1),
+                "blk.0.attn_k.weight" => -((((r * 11 + c * 13 + 2) % 3) as i8) - 1),
+                "blk.0.attn_v.weight" => -((((r * 17 + c * 19) % 3) as i8) - 1),
+                "blk.0.attn_output.weight" => -((((r * 23 + c * 29 + 1) % 3) as i8) - 1),
+                "blk.0.ffn_gate.weight" => -((((r * 31 + c * 37 + 2) % 3) as i8) - 1),
+                "blk.0.ffn_up.weight" => -((((r * 5 + c * 7 + 2) % 3) as i8) - 1),
+                "blk.0.ffn_down.weight" => -((((r * 19 + c * 31 + 2) % 3) as i8) - 1),
+                _ => unreachable!(),
+            });
+        w_mut.insert_tensor(
+            tensor_name,
+            QuantType::TQ1_0,
+            vec![in_dim, out_dim],
+            inverted_pattern,
+        );
+        let logits_mut = run_model(&w_mut);
+        let l2_delta = l2(&logits_base, &logits_mut);
+        if tensor_name == "blk.0.attn_q.weight" || tensor_name == "blk.0.attn_k.weight" {
+            println!(
+                "[RECIPE PROJECTION SENSITIVITY] {tensor_name:28} delta L2 = {l2_delta:.6e} (Note: in single-token causal attention, softmax over 1 token is identically 1.0)"
+            );
+        } else {
+            println!("[RECIPE PROJECTION SENSITIVITY] {tensor_name:28} delta L2 = {l2_delta:.6e}");
+            assert_ne!(
+                logits_base, logits_mut,
+                "Mutating projection {tensor_name} must change output logits"
+            );
+            assert!(
+                l2_delta > 1e-4,
+                "Mutating projection {tensor_name} must produce non-trivial logit delta (got {l2_delta})"
+            );
+        }
+    }
 }
 
 /// Suite 6: Empirical verification of missing SubLN and projection weight fail-closed behavior.
@@ -1234,6 +1284,51 @@ fn test_empirical_numerical_extremes_and_clamping() {
     assert!(scale_inf.is_finite());
     assert_eq!(scale_inf, 1.0 / 127.0);
     assert!(out_inf.iter().all(|&x| x == 0));
+
+    // 6. Subnormal inputs:
+    let subnormal_val = f32::from_bits(1);
+    let input_sub = vec![subnormal_val; dim];
+    let mut out_sub = vec![0i8; dim];
+    let scale_sub = subln_quantize_absmax_i8(&mut out_sub, &input_sub, &norm_weight, eps)
+        .expect("Subnormals must be guarded cleanly");
+    assert!(scale_sub.is_finite());
+    assert_eq!(scale_sub, 1.0 / 127.0);
+    assert!(out_sub.iter().all(|&x| x == 0));
+
+    // Full BitNetRecipe prefill with subnormal inputs in token embeddings:
+    let recipe = BitNetRecipe {
+        architecture: "bitnet",
+        num_layers: 1,
+        hidden_dim: dim,
+        ffn_dim: 512,
+        n_heads_q: 4,
+        n_heads_kv: 2,
+        head_dim: 64,
+        vocab_size: 1024,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+    let mut w_sub = build_synthetic_single_layer_weights(dim, 512, 256, 128, 1.0, 1.0);
+    let mut embd_sub = vec![0u8; 1024 * dim * 4];
+    for t in 0..1024 {
+        for i in 0..dim {
+            let off = (t * dim + i) * 4;
+            embd_sub[off..off + 4].copy_from_slice(&subnormal_val.to_le_bytes());
+        }
+    }
+    w_sub.insert_tensor(
+        "token_embd.weight",
+        QuantType::F32,
+        vec![dim, 1024],
+        embd_sub,
+    );
+    let prompt = [1u32, 2u32];
+    let mut logits_sub = vec![0.0f32; 16];
+    let mut kv_sub = vec![0.0f32; 1024];
+    let mut ctx_sub = ExecutionContext::new(&prompt, 32, &mut logits_sub, &mut kv_sub).unwrap();
+    let res_sub = recipe.prefill_step(&mut ctx_sub, &w_sub);
+    assert!(res_sub.is_ok(), "prefill on subnormal input must not panic");
 }
 
 /// Suite 8: Empirical verification of boundary inputs and invalid quantization rejection.
@@ -1360,5 +1455,39 @@ fn test_empirical_boundary_inputs_and_invalid_quants() {
                 "Unsupported quant {bad_quant:?} for projection must fail"
             ));
         assert!(matches!(err_bad_proj, K3Error::TensorBoundsError { .. }));
+
+        // LM-head projection weight (output.weight) with unsupported quant in prefill_step
+        let mut bad_head_weights =
+            build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
+        bad_head_weights.insert_tensor(
+            "output.weight",
+            bad_quant,
+            vec![hidden_dim, 16],
+            vec![0u8; hidden_dim * 16],
+        );
+        let mut ctx_bad_head = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+        let err_bad_head = recipe
+            .prefill_step(&mut ctx_bad_head, &bad_head_weights)
+            .expect_err(&format!(
+                "Unsupported quant {bad_quant:?} for output.weight must fail closed in prefill"
+            ));
+        assert!(
+            matches!(err_bad_head, K3Error::TensorBoundsError { .. }),
+            "Expected TensorBoundsError for unsupported quant output.weight, got {err_bad_head:?}"
+        );
+
+        // LM-head projection weight with unsupported quant in decode_step
+        let mut ctx_bad_decode = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv).unwrap();
+        recipe.prefill_step(&mut ctx_bad_decode, &weights).unwrap();
+        ctx_bad_decode.prepare_decode(42).unwrap();
+        let err_bad_decode = recipe
+            .decode_step(&mut ctx_bad_decode, &bad_head_weights)
+            .expect_err(&format!(
+                "Unsupported quant {bad_quant:?} for output.weight must fail closed in decode"
+            ));
+        assert!(
+            matches!(err_bad_decode, K3Error::TensorBoundsError { .. }),
+            "Expected TensorBoundsError for unsupported quant output.weight in decode, got {err_bad_decode:?}"
+        );
     }
 }
