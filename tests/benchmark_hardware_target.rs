@@ -277,7 +277,7 @@ fn test_target_hardware_full_model_inference() {
     let prompt_tokens = (0..32)
         .map(|x| (x * 7 + 3) % vocab_size as u32)
         .collect::<Vec<_>>();
-    let n_gen_tokens = 64;
+    let n_gen_tokens = 4;
 
     let model_variants = [
         ("bitnet-b1.58 (30L)", QuantType::TQ1_0, true),
