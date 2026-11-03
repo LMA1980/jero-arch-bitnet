@@ -80,4 +80,36 @@ mod tests {
             .expect("decode succeeds");
         assert_eq!(ctx.position(), 4);
     }
+
+    #[test]
+    fn test_bitnet_recipe_descriptors() {
+        let b = BitNetRecipe::new();
+        assert_eq!(b.architecture_id(), "bitnet");
+        assert_eq!(b.recipe_version(), "1.0.0");
+        assert_eq!(b.target_layouts(), &["native", "ime_tile_8x16"]);
+        assert!(b.supports_quant(QuantType::TQ1_0));
+        assert!(b.supports_quant(QuantType::TQ2_0));
+        assert!(b.supports_quant(QuantType::Q8_0));
+        assert!(b.supports_quant(QuantType::F32));
+        assert!(b.supports_quant(QuantType::F16));
+        assert!(b.supports_quant(QuantType::BF16));
+        assert!(!b.supports_quant(QuantType::Q4_0));
+        assert!(!b.supports_quant(QuantType::Q4_K_M));
+        assert!(!b.supports_quant(QuantType::Q6_K));
+        assert!(b.use_relu2);
+
+        let b158 = BitNetRecipe::new_b158();
+        assert_eq!(b158.architecture_id(), "bitnet-b1.58");
+        assert_eq!(b158.recipe_version(), "1.0.0");
+        assert!(b158.supports_quant(QuantType::TQ1_0));
+        assert!(b158.supports_quant(QuantType::TQ2_0));
+        assert!(b158.use_relu2);
+
+        let b25 = BitNetRecipe::new_25();
+        assert_eq!(b25.architecture_id(), "bitnet-25");
+        assert_eq!(b25.recipe_version(), "1.0.0");
+        assert!(b25.supports_quant(QuantType::TQ1_0));
+        assert!(b25.supports_quant(QuantType::TQ2_0));
+        assert!(!b25.use_relu2);
+    }
 }
