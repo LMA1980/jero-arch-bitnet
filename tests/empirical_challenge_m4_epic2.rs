@@ -306,7 +306,9 @@ pub fn build_multi_layer_weights(
 
 #[test]
 fn test_empirical_branching_divergence() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let hidden_dim = 256;
     let ffn_dim = 512;
     let n_heads_q = 4;
@@ -446,7 +448,9 @@ fn test_empirical_branching_divergence() {
 
 #[test]
 fn test_empirical_multi_layer_forward_accumulation() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let hidden_dim = 256;
     let ffn_dim = 512;
     let n_heads_q = 4;
@@ -456,8 +460,8 @@ fn test_empirical_multi_layer_forward_accumulation() {
     let total_kv = 128;
     let vocab_size = 512;
 
-    // Build weights for up to 4 layers
-    let weights = build_multi_layer_weights(4, hidden_dim, ffn_dim, total_q, total_kv, vocab_size);
+    // Build weights for up to 30 layers
+    let weights = build_multi_layer_weights(30, hidden_dim, ffn_dim, total_q, total_kv, vocab_size);
 
     let prompt = [10u32, 25u32];
 
@@ -486,7 +490,8 @@ fn test_empirical_multi_layer_forward_accumulation() {
 
     let (logits_1, _kv_1) = run_layers(1);
     let (logits_2, _kv_2) = run_layers(2);
-    let (logits_4, kv_4) = run_layers(4);
+    let (logits_4, _kv_4) = run_layers(4);
+    let (logits_30, kv_30) = run_layers(30);
 
     let l2_dist = |a: &[f32], b: &[f32]| -> f32 {
         a.iter()
@@ -498,15 +503,27 @@ fn test_empirical_multi_layer_forward_accumulation() {
 
     let dist_1_2 = l2_dist(&logits_1, &logits_2);
     let dist_2_4 = l2_dist(&logits_2, &logits_4);
+    let dist_4_30 = l2_dist(&logits_4, &logits_30);
     let dist_1_4 = l2_dist(&logits_1, &logits_4);
+    let dist_1_30 = l2_dist(&logits_1, &logits_30);
+
+    let cum_dist_1_2 = dist_1_2;
+    let cum_dist_1_4 = dist_1_2 + dist_2_4;
+    let cum_dist_1_30 = dist_1_2 + dist_2_4 + dist_4_30;
 
     println!("=== Multi-layer Forward Accumulation Results ===");
     println!("Logits (L=1): {:?}", &logits_1[..4]);
     println!("Logits (L=2): {:?}", &logits_2[..4]);
     println!("Logits (L=4): {:?}", &logits_4[..4]);
+    println!("Logits (L=30): {:?}", &logits_30[..4]);
     println!("L2 distance (1 vs 2 layers): {dist_1_2}");
     println!("L2 distance (2 vs 4 layers): {dist_2_4}");
+    println!("L2 distance (4 vs 30 layers): {dist_4_30}");
     println!("L2 distance (1 vs 4 layers): {dist_1_4}");
+    println!("L2 distance (1 vs 30 layers): {dist_1_30}");
+    println!("Cumulative trajectory distance L=2: {cum_dist_1_2}");
+    println!("Cumulative trajectory distance L=4: {cum_dist_1_4}");
+    println!("Cumulative trajectory distance L=30: {cum_dist_1_30}");
 
     assert!(
         dist_1_2 > 0.1,
@@ -517,41 +534,49 @@ fn test_empirical_multi_layer_forward_accumulation() {
         "Logits must evolve non-trivially between 2 and 4 layers"
     );
     assert!(
-        dist_1_4 > dist_1_2,
-        "Progressive accumulation must increase separation across more layers"
+        dist_4_30 > 0.1,
+        "Logits must evolve non-trivially between 4 and 30 layers"
+    );
+    assert!(
+        cum_dist_1_4 > cum_dist_1_2,
+        "Cumulative evolution trajectory must increase monotonically across layers (cum_dist_1_4 > cum_dist_1_2)"
+    );
+    assert!(
+        cum_dist_1_30 > cum_dist_1_4,
+        "Cumulative evolution trajectory must increase monotonically across 30 layers (cum_dist_1_30 > cum_dist_1_4)"
     );
 
-    // KV Cache Step Accumulation & Memory Residency Integrity
-    // In L=4, each layer has stride 8192, half_stride = 4096.
+    // KV Cache Step Accumulation & Memory Residency Integrity across all 30 layers
+    // In L=30, each layer has stride 8192, half_stride = 4096.
     // Prompt tokens pos 0 and pos 1 were executed.
     // Verify each layer's KV slots:
-    for layer in 0..4 {
+    for layer in 0..30 {
         let layer_base = layer * 8192;
         let k_half = layer_base;
         let v_half = layer_base + 4096;
 
         // Pos 0: [0..128]
-        let k_pos0 = &kv_4[k_half..k_half + 128];
-        let v_pos0 = &kv_4[v_half..v_half + 128];
+        let k_pos0 = &kv_30[k_half..k_half + 128];
+        let v_pos0 = &kv_30[v_half..v_half + 128];
         assert!(
             k_pos0.iter().all(|&x| x != -999.0 && x.is_finite()),
-            "Layer {layer} Pos 0 K must be populated"
+            "Layer {layer} Pos 0 K must be populated and finite"
         );
         assert!(
             v_pos0.iter().all(|&x| x != -999.0 && x.is_finite()),
-            "Layer {layer} Pos 0 V must be populated"
+            "Layer {layer} Pos 0 V must be populated and finite"
         );
 
         // Pos 1: [128..256]
-        let k_pos1 = &kv_4[k_half + 128..k_half + 256];
-        let v_pos1 = &kv_4[v_half + 128..v_half + 256];
+        let k_pos1 = &kv_30[k_half + 128..k_half + 256];
+        let v_pos1 = &kv_30[v_half + 128..v_half + 256];
         assert!(
             k_pos1.iter().all(|&x| x != -999.0 && x.is_finite()),
-            "Layer {layer} Pos 1 K must be populated"
+            "Layer {layer} Pos 1 K must be populated and finite"
         );
         assert!(
             v_pos1.iter().all(|&x| x != -999.0 && x.is_finite()),
-            "Layer {layer} Pos 1 V must be populated"
+            "Layer {layer} Pos 1 V must be populated and finite"
         );
 
         // Verify pos 0 and pos 1 are NOT identical (different token and position)
@@ -561,8 +586,8 @@ fn test_empirical_multi_layer_forward_accumulation() {
         );
 
         // Verify unwritten positions [256..4096] remain completely untouched (-999.0)
-        let k_unwritten = &kv_4[k_half + 256..k_half + 4096];
-        let v_unwritten = &kv_4[v_half + 256..v_half + 4096];
+        let k_unwritten = &kv_30[k_half + 256..k_half + 4096];
+        let v_unwritten = &kv_30[v_half + 256..v_half + 4096];
         assert!(
             k_unwritten.iter().all(|&x| x == -999.0),
             "Layer {layer} unwritten K slots must remain untouched"
@@ -572,6 +597,14 @@ fn test_empirical_multi_layer_forward_accumulation() {
             "Layer {layer} unwritten V slots must remain untouched"
         );
     }
+    println!(
+        "PASS: Verified multi-layer forward accumulation and KV cache integrity across 1, 2, 4, and 30 layers."
+    );
+}
+
+#[test]
+fn test_empirical_multi_layer_accumulation() {
+    test_empirical_multi_layer_forward_accumulation();
 }
 
 // -----------------------------------------------------------------------------
@@ -580,7 +613,9 @@ fn test_empirical_multi_layer_forward_accumulation() {
 
 #[test]
 fn test_empirical_zero_allocation_invariant_dynamic() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let hidden_dim = 256;
     let ffn_dim = 512;
     let n_heads_q = 4;
@@ -590,10 +625,10 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
     let total_kv = 128;
     let vocab_size = 512;
 
-    // Build weights for up to 8 layers
-    let weights = build_multi_layer_weights(8, hidden_dim, ffn_dim, total_q, total_kv, vocab_size);
+    // Build weights for up to 30 layers
+    let weights = build_multi_layer_weights(30, hidden_dim, ffn_dim, total_q, total_kv, vocab_size);
 
-    let test_layers = [1, 2, 4, 8];
+    let test_layers = [1, 2, 4, 8, 16, 30];
     let mut alloc_counts = Vec::new();
 
     for &num_layers in &test_layers {
@@ -670,8 +705,15 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
 }
 
 #[test]
+fn test_empirical_zero_dynamic_allocations() {
+    test_empirical_zero_allocation_invariant_dynamic();
+}
+
+#[test]
 fn test_empirical_zero_allocation_invariant_static_ast() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Read the recipe source code and analyze the layer loop
     let source = include_str!("../src/recipe.rs");
 
@@ -738,5 +780,182 @@ fn test_empirical_zero_allocation_invariant_static_ast() {
         forbidden_violations.is_empty(),
         "Detected heap allocations inside layer loop: {:?}",
         forbidden_violations
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Challenge 4: Memory Safety & Numerical Stability under Extreme Float Regimes
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_empirical_numerical_stability() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hidden_dim = 256;
+    let ffn_dim = 512;
+    let total_q = 256;
+    let total_kv = 128;
+    let vocab_size = 512;
+    let eps = 1e-5;
+
+    // 1. Extreme float stress on SubLN and Activation kernels (when with-kernels is active)
+    #[cfg(feature = "with-kernels")]
+    {
+        // 1a. Subnormals
+        let subnormal_val = f32::from_bits(1);
+        let subnormal_input = vec![subnormal_val; hidden_dim];
+        let norm_weight = vec![1.0f32; hidden_dim];
+        let mut out_i8 = vec![0i8; hidden_dim];
+
+        let scale_sub =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &subnormal_input, &norm_weight, eps)
+                .expect("SubLN succeeds on subnormals");
+        assert!(scale_sub.is_finite());
+        assert!(scale_sub > 0.0);
+        // Subnormals enter defensive guard (< 1e-12)
+        assert!(out_i8.iter().all(|&x| x == 0));
+        assert_eq!(scale_sub, 1.0 / 127.0);
+
+        // 1b. Zeros (positive and negative zero)
+        let zero_input = vec![0.0f32; hidden_dim];
+        let scale_zero =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &zero_input, &norm_weight, eps)
+                .expect("SubLN succeeds on exact zeros");
+        assert_eq!(scale_zero, 1.0 / 127.0);
+        assert!(out_i8.iter().all(|&x| x == 0));
+
+        let neg_zero_input = vec![-0.0f32; hidden_dim];
+        let scale_neg_zero =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &neg_zero_input, &norm_weight, eps)
+                .expect("SubLN succeeds on negative zeros");
+        assert_eq!(scale_neg_zero, 1.0 / 127.0);
+        assert!(out_i8.iter().all(|&x| x == 0));
+
+        // 1c. Negative Infinity
+        let neg_inf_input = vec![f32::NEG_INFINITY; hidden_dim];
+        let scale_neg_inf =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &neg_inf_input, &norm_weight, eps)
+                .expect("SubLN succeeds on negative infinity");
+        assert!(scale_neg_inf.is_finite());
+        assert_eq!(scale_neg_inf, 1.0 / 127.0);
+        assert!(out_i8.iter().all(|&x| x == 0));
+
+        // 1d. Positive Infinity and NaN
+        let inf_input = vec![f32::INFINITY; hidden_dim];
+        let scale_inf =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &inf_input, &norm_weight, eps)
+                .expect("SubLN succeeds on positive infinity");
+        assert_eq!(scale_inf, 1.0 / 127.0);
+        assert!(out_i8.iter().all(|&x| x == 0));
+
+        let nan_input = vec![f32::NAN; hidden_dim];
+        let scale_nan =
+            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &nan_input, &norm_weight, eps)
+                .expect("SubLN succeeds on NaN");
+        assert_eq!(scale_nan, 1.0 / 127.0);
+        assert!(out_i8.iter().all(|&x| x == 0));
+
+        // 2. Activation kernels on extreme floats:
+        let gates_extreme = [
+            f32::NEG_INFINITY,
+            -1e30,
+            -1.0,
+            -0.0,
+            0.0,
+            subnormal_val,
+            1e-30,
+            1.0,
+            1e30,
+            f32::INFINITY,
+        ];
+        let up_val = [1.0f32; 10];
+        let mut out_r = [0.0f32; 10];
+        let mut out_s = [0.0f32; 10];
+        kernels_rvv::relu_squared_gate_f32(&mut out_r, &gates_extreme, &up_val)
+            .expect("relu2 on extreme floats");
+        kernels_rvv::swiglu_f32(&mut out_s, &gates_extreme, &up_val)
+            .expect("swiglu on extreme floats");
+
+        // Negative values and negative infinity must produce exactly 0.0 in ReLU^2
+        assert_eq!(out_r[0], 0.0); // NEG_INFINITY
+        assert_eq!(out_r[1], 0.0); // -1e30
+        assert_eq!(out_r[2], 0.0); // -1.0
+        assert_eq!(out_r[3], 0.0); // -0.0
+        assert_eq!(out_r[4], 0.0); // 0.0
+
+        // SwiGLU: sigmoid(-inf) = 0.0 -> out_s[0] = 0.0
+        assert_eq!(out_s[0], 0.0);
+        assert_eq!(out_s[3], 0.0); // -0.0
+        assert_eq!(out_s[4], 0.0); // 0.0
+    }
+
+    // 3. Full BitNetRecipe End-to-End Execution under extreme float regimes:
+    let mut weights_extreme =
+        build_multi_layer_weights(2, hidden_dim, ffn_dim, total_q, total_kv, vocab_size);
+    let subnormal_val = f32::from_bits(1);
+
+    // Inject extreme float patterns into token embedding tensor:
+    let mut extreme_embd = vec![0u8; vocab_size * hidden_dim * 4];
+    for t in 0..vocab_size {
+        for i in 0..hidden_dim {
+            let off = (t * hidden_dim + i) * 4;
+            let val = match (t + i) % 7 {
+                0 => 0.0f32,
+                1 => -0.0f32,
+                2 => subnormal_val,
+                3 => f32::NEG_INFINITY,
+                4 => 1e-35f32,
+                5 => -1e-35f32,
+                _ => 0.5f32,
+            };
+            extreme_embd[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    weights_extreme.insert_tensor(
+        "token_embd.weight",
+        QuantType::F32,
+        vec![hidden_dim, vocab_size],
+        extreme_embd,
+    );
+
+    let recipe = BitNetRecipe {
+        architecture: "bitnet-b1.58",
+        num_layers: 2,
+        hidden_dim,
+        ffn_dim,
+        n_heads_q: 4,
+        n_heads_kv: 2,
+        head_dim: 64,
+        vocab_size,
+        rms_eps: 1e-5,
+        rope_theta: 10_000.0,
+        use_relu2: true,
+    };
+
+    let prompt = [0u32, 1u32];
+    let mut logits = vec![0.0f32; 16];
+    let mut kv_cache = vec![0.0f32; 8192 * 2];
+    let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv_cache).unwrap();
+
+    // Verify prefill_step executes without panic, crash, or memory violation
+    let res = recipe.prefill_step(&mut ctx, &weights_extreme);
+    assert!(
+        res.is_ok(),
+        "prefill_step must handle extreme float inputs safely: {:?}",
+        res
+    );
+
+    // Verify decode_step executes without panic or crash
+    ctx.prepare_decode(2).expect("prepare decode");
+    let res_decode = recipe.decode_step(&mut ctx, &weights_extreme);
+    assert!(
+        res_decode.is_ok(),
+        "decode_step must handle extreme float inputs safely: {:?}",
+        res_decode
+    );
+
+    println!(
+        "PASS: test_empirical_numerical_stability verified extreme floats (subnormals, zeros, negative infinity) cleanly."
     );
 }

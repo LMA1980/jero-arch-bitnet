@@ -1,7 +1,7 @@
 #![allow(clippy::all, clippy::pedantic, clippy::restriction)]
 //! Hardware Target Benchmark Test for `SpacemiT` K3 (Milestone 4 Epic 2)
 //!
-//! Evaluates authentic native hardware performance on `pey-wail-deu`:
+//! Evaluates authentic native hardware performance on the SpacemiT K3 Reference Platform (16-core riscv64):
 //! 1. Micro-benchmarks: `TQ1_0/TQ2_0` unpacking, `SubLN`, ReLU^2, and `BitLinear` RVV vs IME.
 //! 2. Full-model 30-layer inference: `BitNetRecipe` across 30 layers, 2560 hidden, 6912 FFN.
 

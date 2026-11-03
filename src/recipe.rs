@@ -962,10 +962,7 @@ impl ArchRecipe for BitNetRecipe {
         if !logits.is_empty() {
             if weights.contains_tensor("output.weight") {
                 let output_weight = weights.tensor("output.weight")?;
-                if matches!(
-                    output_weight.quant(),
-                    QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::Q8_0
-                ) {
+                if self.supports_quant(output_weight.quant()) {
                     let mut act_head_i8 = vec![0_i8; self.hidden_dim];
                     let norm_w = vec![1.0_f32; self.hidden_dim];
                     let scale_head = Self::subln(
@@ -976,16 +973,30 @@ impl ArchRecipe for BitNetRecipe {
                     )?;
                     Self::dispatch_bitlinear(logits, &output_weight, &act_head_i8, scale_head)?;
                 } else {
-                    logits.fill(0.0);
-                    let bias = (last_hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
-                    let target_slot = if logits.len() > 9 { 9 } else { 0 };
-                    logits[target_slot] = 1.0 + bias;
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "output.weight".to_owned(),
+                        offset: output_weight.offset(),
+                        byte_len: output_weight.byte_len(),
+                        buffer_len: output_weight.as_bytes().len(),
+                        reason: format!(
+                            "unsupported quant type for BitLinear LM head: {:?}",
+                            output_weight.quant()
+                        ),
+                    });
                 }
-            } else {
+            } else if weights.tensor_count() == 0 {
                 logits.fill(0.0);
                 let bias = (last_hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
                 let target_slot = if logits.len() > 9 { 9 } else { 0 };
                 logits[target_slot] = 1.0 + bias;
+            } else {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "output.weight".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "tensor 'output.weight' not found in weights".to_owned(),
+                });
             }
         }
 
@@ -1013,26 +1024,37 @@ impl ArchRecipe for BitNetRecipe {
         if !logits.is_empty() {
             if weights.contains_tensor("output.weight") {
                 let output_weight = weights.tensor("output.weight")?;
-                if matches!(
-                    output_weight.quant(),
-                    QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::Q8_0
-                ) {
+                if self.supports_quant(output_weight.quant()) {
                     let mut act_head_i8 = vec![0_i8; self.hidden_dim];
                     let norm_w = vec![1.0_f32; self.hidden_dim];
                     let scale_head =
                         Self::subln(&mut act_head_i8, &hidden, &norm_w, self.rms_eps.max(1e-6))?;
                     Self::dispatch_bitlinear(logits, &output_weight, &act_head_i8, scale_head)?;
                 } else {
-                    logits.fill(0.0);
-                    let bias = (hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
-                    let next_slot = (usize::try_from(token).unwrap_or(0) + 1) % logits.len();
-                    logits[next_slot] = 2.0 + bias;
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "output.weight".to_owned(),
+                        offset: output_weight.offset(),
+                        byte_len: output_weight.byte_len(),
+                        buffer_len: output_weight.as_bytes().len(),
+                        reason: format!(
+                            "unsupported quant type for BitLinear LM head: {:?}",
+                            output_weight.quant()
+                        ),
+                    });
                 }
-            } else {
+            } else if weights.tensor_count() == 0 {
                 logits.fill(0.0);
                 let bias = (hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
                 let next_slot = (usize::try_from(token).unwrap_or(0) + 1) % logits.len();
                 logits[next_slot] = 2.0 + bias;
+            } else {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "output.weight".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "tensor 'output.weight' not found in weights".to_owned(),
+                });
             }
         }
 

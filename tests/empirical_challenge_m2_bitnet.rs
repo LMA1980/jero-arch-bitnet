@@ -158,6 +158,23 @@ pub fn build_synthetic_single_layer_weights(
 ) -> SyntheticBitNetWeights {
     let mut weights = SyntheticBitNetWeights::new();
 
+    // Token embedding: [hidden_dim, 1024]
+    let vocab_size = 1024;
+    let mut embd_raw = vec![0u8; vocab_size * hidden_dim * 4];
+    for t in 0..vocab_size {
+        for i in 0..hidden_dim {
+            let off = (t * hidden_dim + i) * 4;
+            let val = ((t * 7 + i * 13) % 97) as f32 * 0.05 - 2.0;
+            embd_raw[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    weights.insert_tensor(
+        "token_embd.weight",
+        QuantType::F32,
+        vec![hidden_dim, vocab_size],
+        embd_raw,
+    );
+
     // Layer 0 SubLN and normalization weights
     weights.insert_tensor(
         "blk.0.attn_sub_norm.weight",
@@ -196,55 +213,63 @@ pub fn build_synthetic_single_layer_weights(
         "blk.0.attn_q.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, total_q],
-        create_synthetic_tq1_0_raw(total_q, hidden_dim, 1),
+        create_synthetic_tq1_0_pattern(total_q, hidden_dim, |r, c| {
+            (((r * 7 + c * 11 + 1) % 3) as i8) - 1
+        }),
     );
     // K: [cols=256, rows=128]
     weights.insert_tensor(
         "blk.0.attn_k.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, total_kv],
-        create_synthetic_tq1_0_raw(total_kv, hidden_dim, 1),
+        create_synthetic_tq1_0_pattern(total_kv, hidden_dim, |r, c| {
+            (((r * 11 + c * 13 + 2) % 3) as i8) - 1
+        }),
     );
     // V: [cols=256, rows=128]
     weights.insert_tensor(
         "blk.0.attn_v.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, total_kv],
-        create_synthetic_tq1_0_raw(total_kv, hidden_dim, 1),
+        create_synthetic_tq1_0_pattern(total_kv, hidden_dim, |r, c| {
+            (((r * 17 + c * 19) % 3) as i8) - 1
+        }),
     );
     // Output: [cols=256, rows=256]
     weights.insert_tensor(
         "blk.0.attn_output.weight",
         QuantType::TQ1_0,
         vec![total_q, hidden_dim],
-        create_synthetic_tq1_0_raw(hidden_dim, total_q, 1),
+        create_synthetic_tq1_0_pattern(hidden_dim, total_q, |r, c| {
+            (((r * 23 + c * 29 + 1) % 3) as i8) - 1
+        }),
     );
     // Gate: [cols=256, rows=512] with alternating positive/negative rows
     weights.insert_tensor(
         "blk.0.ffn_gate.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, ffn_dim],
-        create_synthetic_tq1_0_pattern(
-            ffn_dim,
-            hidden_dim,
-            |r, _c| {
-                if r % 2 == 0 { 1 } else { -1 }
-            },
-        ),
+        create_synthetic_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| {
+            (((r * 31 + c * 37 + 2) % 3) as i8) - 1
+        }),
     );
     // Up: [cols=256, rows=512]
     weights.insert_tensor(
         "blk.0.ffn_up.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, ffn_dim],
-        create_synthetic_tq1_0_raw(ffn_dim, hidden_dim, 1),
+        create_synthetic_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| {
+            (((r * 5 + c * 7 + 2) % 3) as i8) - 1
+        }),
     );
     // Down: [cols=512, rows=256]
     weights.insert_tensor(
         "blk.0.ffn_down.weight",
         QuantType::TQ1_0,
         vec![ffn_dim, hidden_dim],
-        create_synthetic_tq1_0_raw(hidden_dim, ffn_dim, 1),
+        create_synthetic_tq1_0_pattern(hidden_dim, ffn_dim, |r, c| {
+            (((r * 19 + c * 31 + 2) % 3) as i8) - 1
+        }),
     );
 
     // LM head output projection matrix
@@ -252,7 +277,9 @@ pub fn build_synthetic_single_layer_weights(
         "output.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, 16],
-        create_synthetic_tq1_0_raw(16, hidden_dim, 1),
+        create_synthetic_tq1_0_pattern(16, hidden_dim, |r, c| {
+            (((r * 13 + c * 17 + 1) % 3) as i8) - 1
+        }),
     );
 
     weights
