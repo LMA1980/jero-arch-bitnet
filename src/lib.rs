@@ -61,7 +61,15 @@ mod tests {
 
     #[test]
     fn test_bitnet_recipe_execution_flow() {
-        let recipe = BitNetRecipe::new();
+        let mut recipe = BitNetRecipe::new();
+        recipe.num_layers = 1;
+        if cfg!(miri) {
+            recipe.hidden_dim = 64;
+            recipe.ffn_dim = 128;
+            recipe.n_heads_q = 4;
+            recipe.n_heads_kv = 2;
+            recipe.head_dim = 16;
+        }
         let prompt_tokens = [1u32, 2, 3];
         let mut logits = [0.0f32; 16];
         let mut kv_cache = [0.0f32; 64];
