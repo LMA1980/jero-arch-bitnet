@@ -4,11 +4,11 @@
 //! `"bitnet-b1.58"`, and `"bitnet-25"`, with mandatory `SubLN` prior to every
 //! `BitLinear` projection per ADR-023, ADR-024, and ADR-037.
 
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 use std::fmt::Write as _;
 
 #[cfg(feature = "with-kernels")]
-use kernels_rvv::{
+use jero_kernels_rvv::{
     apply_rope_inplace, bf16_to_f32_finite, bitlinear_i8_rvv, f16_to_f32_finite,
     gqa_causal_attention_f32, relu_squared_gate_f32, subln_quantize_absmax_i8, swiglu_f32,
 };

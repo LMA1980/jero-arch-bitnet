@@ -1,10 +1,10 @@
 version: "1"
-service: "k3-arch-bitnet"
+service: "jero-arch-bitnet"
 
 deployment:
   target_nodes:
     - "worker-riscv64"
-  binary_name: "k3-arch-bitnet"
+  binary_name: "jero-arch-bitnet"
 
 integration_tests:
   - "unit-tests"

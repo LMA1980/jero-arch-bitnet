@@ -14,8 +14,8 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-use k3_arch_bitnet::BitNetRecipe;
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use jero_arch_bitnet::BitNetRecipe;
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -684,8 +684,8 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
 
     #[cfg(feature = "with-kernels")]
     {
-        // When linked with kernels-rvv, recipe.rs itself adds 0 allocations inside the loop.
-        // Downstream kernels-rvv calls account for:
+        // When linked with jero-kernels-rvv, recipe.rs itself adds 0 allocations inside the loop.
+        // Downstream jero-kernels-rvv calls account for:
         // - apply_rope_inplace: allocates 1 inv_freq vector per head (4 Q heads + 2 KV heads = 6)
         // - gqa_causal_attention_f32: allocates 1 score vector per layer (1)
         // Total per layer = 7 allocations.
@@ -694,12 +694,12 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
             let expected = 24 + 7 * layers;
             assert_eq!(
                 count, expected,
-                "For {layers} layers with kernels-rvv, expected {expected} allocations \
+                "For {layers} layers with jero-kernels-rvv, expected {expected} allocations \
                  (24 base + 7 per layer from rope/gqa), got {count}."
             );
         }
         println!(
-            "PASS: recipe.rs layer loop adds 0 direct allocations. Exactly 7 allocations per layer occur in kernels-rvv (6 RoPE + 1 GQA)."
+            "PASS: recipe.rs layer loop adds 0 direct allocations. Exactly 7 allocations per layer occur in jero-kernels-rvv (6 RoPE + 1 GQA)."
         );
     }
 }
@@ -808,9 +808,13 @@ fn test_empirical_numerical_stability() {
         let norm_weight = vec![1.0f32; hidden_dim];
         let mut out_i8 = vec![0i8; hidden_dim];
 
-        let scale_sub =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &subnormal_input, &norm_weight, eps)
-                .expect("SubLN succeeds on subnormals");
+        let scale_sub = jero_kernels_rvv::subln_quantize_absmax_i8(
+            &mut out_i8,
+            &subnormal_input,
+            &norm_weight,
+            eps,
+        )
+        .expect("SubLN succeeds on subnormals");
         assert!(scale_sub.is_finite());
         assert!(scale_sub > 0.0);
         // Subnormals enter defensive guard (< 1e-12)
@@ -820,23 +824,31 @@ fn test_empirical_numerical_stability() {
         // 1b. Zeros (positive and negative zero)
         let zero_input = vec![0.0f32; hidden_dim];
         let scale_zero =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &zero_input, &norm_weight, eps)
+            jero_kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &zero_input, &norm_weight, eps)
                 .expect("SubLN succeeds on exact zeros");
         assert_eq!(scale_zero, 1.0 / 127.0);
         assert!(out_i8.iter().all(|&x| x == 0));
 
         let neg_zero_input = vec![-0.0f32; hidden_dim];
-        let scale_neg_zero =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &neg_zero_input, &norm_weight, eps)
-                .expect("SubLN succeeds on negative zeros");
+        let scale_neg_zero = jero_kernels_rvv::subln_quantize_absmax_i8(
+            &mut out_i8,
+            &neg_zero_input,
+            &norm_weight,
+            eps,
+        )
+        .expect("SubLN succeeds on negative zeros");
         assert_eq!(scale_neg_zero, 1.0 / 127.0);
         assert!(out_i8.iter().all(|&x| x == 0));
 
         // 1c. Negative Infinity
         let neg_inf_input = vec![f32::NEG_INFINITY; hidden_dim];
-        let scale_neg_inf =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &neg_inf_input, &norm_weight, eps)
-                .expect("SubLN succeeds on negative infinity");
+        let scale_neg_inf = jero_kernels_rvv::subln_quantize_absmax_i8(
+            &mut out_i8,
+            &neg_inf_input,
+            &norm_weight,
+            eps,
+        )
+        .expect("SubLN succeeds on negative infinity");
         assert!(scale_neg_inf.is_finite());
         assert_eq!(scale_neg_inf, 1.0 / 127.0);
         assert!(out_i8.iter().all(|&x| x == 0));
@@ -844,14 +856,14 @@ fn test_empirical_numerical_stability() {
         // 1d. Positive Infinity and NaN
         let inf_input = vec![f32::INFINITY; hidden_dim];
         let scale_inf =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &inf_input, &norm_weight, eps)
+            jero_kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &inf_input, &norm_weight, eps)
                 .expect("SubLN succeeds on positive infinity");
         assert_eq!(scale_inf, 1.0 / 127.0);
         assert!(out_i8.iter().all(|&x| x == 0));
 
         let nan_input = vec![f32::NAN; hidden_dim];
         let scale_nan =
-            kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &nan_input, &norm_weight, eps)
+            jero_kernels_rvv::subln_quantize_absmax_i8(&mut out_i8, &nan_input, &norm_weight, eps)
                 .expect("SubLN succeeds on NaN");
         assert_eq!(scale_nan, 1.0 / 127.0);
         assert!(out_i8.iter().all(|&x| x == 0));
@@ -872,9 +884,9 @@ fn test_empirical_numerical_stability() {
         let up_val = [1.0f32; 10];
         let mut out_r = [0.0f32; 10];
         let mut out_s = [0.0f32; 10];
-        kernels_rvv::relu_squared_gate_f32(&mut out_r, &gates_extreme, &up_val)
+        jero_kernels_rvv::relu_squared_gate_f32(&mut out_r, &gates_extreme, &up_val)
             .expect("relu2 on extreme floats");
-        kernels_rvv::swiglu_f32(&mut out_s, &gates_extreme, &up_val)
+        jero_kernels_rvv::swiglu_f32(&mut out_s, &gates_extreme, &up_val)
             .expect("swiglu on extreme floats");
 
         // Negative values and negative infinity must produce exactly 0.0 in ReLU^2
