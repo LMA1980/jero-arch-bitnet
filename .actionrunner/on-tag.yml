@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-bitnet Release Pipeline"
+name: "jero-arch-bitnet Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always

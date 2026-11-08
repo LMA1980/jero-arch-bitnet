@@ -1,4 +1,4 @@
-//! `k3-arch-bitnet`: `BitNet` architecture recipe for the `SpacemiT` K3 platform.
+//! `jero-arch-bitnet`: `BitNet` architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Microsoft `BitNet` architectures (`bitnet`, `bitnet-b1.58`,
 //! and `bitnet-25`), supporting `SubLN` (`RMSNorm` followed by dynamic per-token int8 `absmax`
@@ -13,14 +13,14 @@ pub use recipe::BitNetRecipe;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{ArchRecipe, ExecutionContext, QuantType};
+    use jero_core::{ArchRecipe, ExecutionContext, QuantType};
 
     #[derive(Debug)]
     struct EmptyWeights;
 
-    impl k3_core::ModelWeights for EmptyWeights {
-        fn tensor(&self, name: &str) -> Result<k3_core::TensorView<'_>, k3_core::K3Error> {
-            Err(k3_core::K3Error::TensorBoundsError {
+    impl jero_core::ModelWeights for EmptyWeights {
+        fn tensor(&self, name: &str) -> Result<jero_core::TensorView<'_>, jero_core::K3Error> {
+            Err(jero_core::K3Error::TensorBoundsError {
                 tensor_name: name.to_owned(),
                 offset: 0,
                 byte_len: 0,

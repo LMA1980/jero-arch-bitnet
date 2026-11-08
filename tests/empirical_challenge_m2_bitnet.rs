@@ -11,9 +11,9 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-use k3_arch_bitnet::BitNetRecipe;
-use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
-use kernels_rvv::{bitlinear_i8_rvv, subln_quantize_absmax_i8};
+use jero_arch_bitnet::BitNetRecipe;
+use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use jero_kernels_rvv::{bitlinear_i8_rvv, subln_quantize_absmax_i8};
 use std::collections::HashMap;
 
 /// In-memory synthetic weights container for BitNet test scenarios.
@@ -772,8 +772,8 @@ fn test_bitnet_subln_and_recipe() {
     let u = [1.0f32; 4];
     let mut out_r = [0.0f32; 4];
     let mut out_s = [0.0f32; 4];
-    kernels_rvv::relu_squared_gate_f32(&mut out_r, &g, &u).expect("relu2");
-    kernels_rvv::swiglu_f32(&mut out_s, &g, &u).expect("swiglu");
+    jero_kernels_rvv::relu_squared_gate_f32(&mut out_r, &g, &u).expect("relu2");
+    jero_kernels_rvv::swiglu_f32(&mut out_s, &g, &u).expect("swiglu");
     assert_eq!(out_r[0], 0.0);
     assert_eq!(out_r[1], 0.0);
     assert!((out_s[1] - (-0.26894)).abs() < 1e-3);
