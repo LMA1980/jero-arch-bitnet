@@ -4,19 +4,116 @@
 //! `"bitnet-b1.58"`, and `"bitnet-25"`, with mandatory `SubLN` prior to every
 //! `BitLinear` projection per ADR-023, ADR-024, and ADR-037.
 
-use crate::repack_cache::{BitNetModelCache, BitNetVocabContract};
+use crate::repack_cache::{BitNetModelCache, BitNetVocabContract, DecodeWorkerPool};
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView,
-    ModelMetadata, ModelWeights, QuantType, TensorView,
+    ModelMetadata, ModelWeights, QuantType, ScratchScope, ScratchWorkspace, TensorView,
 };
 use std::fmt::Write as _;
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    apply_rope_inplace, bf16_to_f32_finite, bitlinear_i8_rvv, dequantize_tensor_row,
-    f16_to_f32_finite, gqa_causal_attention_f32, relu_squared_gate_f32, subln_quantize_absmax_i8,
+    QuantizedActQ8View, RopeType, apply_rope_inplace, apply_rope_with_cos_sin, bf16_to_f32_finite,
+    bitlinear_i8_rvv, compute_rope_cos_sin, dequantize_tensor_row, f16_to_f32_finite,
+    gqa_causal_attention_with_scratch_f32, relu_squared_gate_f32, subln_quantize_absmax_i8,
     swiglu_f32,
 };
+
+struct StackLayerKey {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl StackLayerKey {
+    #[inline]
+    fn format(layer: usize, suffix: &str) -> Self {
+        let mut buf = [0_u8; 64];
+        let mut pos = 0_usize;
+        for &b in b"blk." {
+            buf[pos] = b;
+            pos += 1;
+        }
+        let mut digits = [0_u8; 20];
+        let mut n = layer;
+        let mut d_len = 0_usize;
+        loop {
+            #[expect(clippy::cast_possible_truncation, reason = "n % 10 is in 0..10")]
+            {
+                digits[d_len] = b'0' + (n % 10) as u8;
+            }
+            d_len += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        for i in (0..d_len).rev() {
+            buf[pos] = digits[i];
+            pos += 1;
+        }
+        buf[pos] = b'.';
+        pos += 1;
+        let suffix_bytes = suffix.as_bytes();
+        let copy_len = suffix_bytes.len().min(buf.len() - pos);
+        buf[pos..pos + copy_len].copy_from_slice(&suffix_bytes[..copy_len]);
+        pos += copy_len;
+        Self { buf, len: pos }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+#[cold]
+fn missing_tensor_error(name: &str) -> K3Error {
+    K3Error::TensorBoundsError {
+        tensor_name: name.to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: 0,
+        reason: format!("tensor '{name}' not found in weights"),
+    }
+}
+
+#[cold]
+fn kv_dim_mismatch_error(layer: usize, total_kv: usize, actual_kv_dim: usize) -> K3Error {
+    K3Error::TensorBoundsError {
+        tensor_name: format!("kv_cache.layer.{layer}"),
+        offset: 0,
+        byte_len: total_kv * size_of::<f32>(),
+        buffer_len: actual_kv_dim * size_of::<f32>(),
+        reason: format!("KvGeometry kv_dim {actual_kv_dim} does not match total_kv {total_kv}"),
+    }
+}
+
+#[cold]
+fn kv_stride_error(
+    req_hist_elems: usize,
+    num_layers: usize,
+    kv_cache_bytes: usize,
+    half_stride: usize,
+    position: usize,
+) -> K3Error {
+    K3Error::TensorBoundsError {
+        tensor_name: "kv_cache".to_owned(),
+        offset: 0,
+        byte_len: req_hist_elems * 2 * num_layers * size_of::<f32>(),
+        buffer_len: kv_cache_bytes,
+        reason: format!(
+            "kv_cache half-layer stride {half_stride} is smaller than required {req_hist_elems} elements for position {position}"
+        ),
+    }
+}
+
+#[inline]
+const fn aligned_scratch_slot_bytes(elem_bytes: usize, len: usize) -> usize {
+    let raw = len.saturating_mul(elem_bytes);
+    let blocks = raw.div_ceil(128);
+    let rounded = blocks.saturating_mul(128);
+    if rounded < 128 { 128 } else { rounded }
+}
 
 pub(crate) enum KvStorage<'a> {
     View(KvCacheView<'a>),
@@ -1196,11 +1293,27 @@ impl BitNetRecipe {
                 reason: "absmax quantization dimension mismatch".to_owned(),
             });
         }
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            if let Some(scale) = Self::quantize_absmax_i8_rvv(out_i8, input) {
+                return Ok(scale);
+            }
+            out_i8.fill(0);
+            Ok(1.0 / 127.0)
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        {
+            Ok(Self::quantize_absmax_i8_scalar(out_i8, input))
+        }
+    }
+
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    fn quantize_absmax_i8_scalar(out_i8: &mut [i8], input: &[f32]) -> f32 {
         let mut max_abs = 0.0_f32;
         for &val in input {
             if !val.is_finite() {
                 out_i8.fill(0);
-                return Ok(1.0 / 127.0);
+                return 1.0 / 127.0;
             }
             let abs_val = val.abs();
             if abs_val > max_abs {
@@ -1209,7 +1322,7 @@ impl BitNetRecipe {
         }
         if !max_abs.is_finite() || max_abs < 1e-12 {
             out_i8.fill(0);
-            return Ok(1.0 / 127.0);
+            return 1.0 / 127.0;
         }
         let scale = max_abs / 127.0;
         for (dst, &val) in out_i8.iter_mut().zip(input) {
@@ -1219,7 +1332,138 @@ impl BitNetRecipe {
                 *dst = q as i8;
             }
         }
-        Ok(scale)
+        scale
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    fn quantize_absmax_i8_rvv_find_max(input: &[f32]) -> Option<f32> {
+        let ptr_x = input.as_ptr();
+        let rem = input.len();
+        let zero_f = 0.0_f32;
+        let fmax = f32::MAX;
+        let max_abs: f32;
+        let mut bad_count = 0_usize;
+        // SAFETY: `input` contains `rem` readable `f32`s; `vsetvli {vl}, {rem}, e32, m4` with
+        // `vmfle.vf v0, |x|, f32::MAX` counts every non-finite (`NaN`/`+-Inf`) lane into
+        // `bad_count` and replaces non-finite lanes with `0.0` before `vfredmax.vs`.
+        unsafe {
+            core::arch::asm!(
+                "vsetivli zero, 1, e32, m1, ta, ma",
+                "vfmv.s.f v2, {z}",
+                "2:",
+                "vsetvli {vl}, {rem}, e32, m4, ta, ma",
+                "vle32.v v8, ({px})",
+                "vfabs.v v12, v8",
+                "vmfle.vf v0, v12, {fmax}",
+                "vcpop.m t0, v0",
+                "sub t1, {vl}, t0",
+                "add {bad}, {bad}, t1",
+                "vfmv.v.f v16, {z}",
+                "vmerge.vvm v12, v16, v12, v0",
+                "vfredmax.vs v2, v12, v2",
+                "slli t0, {vl}, 2",
+                "add {px}, {px}, t0",
+                "sub {rem}, {rem}, {vl}",
+                "bnez {rem}, 2b",
+                "vsetivli zero, 1, e32, m1, ta, ma",
+                "vfmv.f.s {amax}, v2",
+                px = inout(reg) ptr_x => _,
+                rem = inout(reg) rem => _,
+                z = in(freg) zero_f,
+                fmax = in(freg) fmax,
+                amax = out(freg) max_abs,
+                bad = inout(reg) bad_count,
+                vl = out(reg) _,
+                out("t0") _,
+                out("t1") _,
+                out("v0") _,
+                out("v2") _,
+                out("v8") _,
+                out("v9") _,
+                out("v10") _,
+                out("v11") _,
+                out("v12") _,
+                out("v13") _,
+                out("v14") _,
+                out("v15") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
+                options(nostack, readonly),
+            );
+        }
+        if bad_count > 0 || !max_abs.is_finite() || max_abs < 1e-12 {
+            return None;
+        }
+        let scale = max_abs / 127.0;
+        (scale.is_finite() && scale != 0.0).then_some(scale)
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    fn quantize_absmax_i8_rvv_store(out_i8: &mut [i8], input: &[f32], scale: f32) {
+        let min_q = -128.0_f32;
+        let max_q = 127.0_f32;
+        let ptr_x = input.as_ptr();
+        let ptr_out = out_i8.as_mut_ptr();
+        let rem = input.len();
+        let saved_frm: usize;
+        // SAFETY: `input` and `out_i8` share length `rem`; `input` contains finite `f32`s and
+        // `out_i8` is writable. Setting `frm = 4` (`RMM`, round-half-away-from-zero) before
+        // `vfcvt.x.f.v` matches `f32::round` after clamping into `[-128.0, 127.0]`, and narrowing
+        // `e32,m4 -> e16,m2 -> e8,m1` preserves `VLMAX` across all three configs on `VLEN >= 128`.
+        // `frm` is restored before returning.
+        unsafe {
+            core::arch::asm!(
+                "csrrwi {saved_frm}, frm, 4",
+                "2:",
+                "vsetvli {vl}, {rem}, e32, m4, ta, ma",
+                "vle32.v v8, ({px})",
+                "vfdiv.vf v8, v8, {scale}",
+                "vfmax.vf v8, v8, {min_q}",
+                "vfmin.vf v8, v8, {max_q}",
+                "vfcvt.x.f.v v8, v8",
+                "vsetvli zero, {vl}, e16, m2, ta, ma",
+                "vnsra.wi v4, v8, 0",
+                "vsetvli zero, {vl}, e8, m1, ta, ma",
+                "vnsra.wi v2, v4, 0",
+                "vse8.v v2, ({po})",
+                "slli t0, {vl}, 2",
+                "add {px}, {px}, t0",
+                "add {po}, {po}, {vl}",
+                "sub {rem}, {rem}, {vl}",
+                "bnez {rem}, 2b",
+                "csrw frm, {saved_frm}",
+                px = inout(reg) ptr_x => _,
+                po = inout(reg) ptr_out => _,
+                rem = inout(reg) rem => _,
+                scale = in(freg) scale,
+                min_q = in(freg) min_q,
+                max_q = in(freg) max_q,
+                saved_frm = out(reg) saved_frm,
+                vl = out(reg) _,
+                out("t0") _,
+                out("v2") _,
+                out("v4") _,
+                out("v5") _,
+                out("v8") _,
+                out("v9") _,
+                out("v10") _,
+                out("v11") _,
+                options(nostack),
+            );
+        }
+        let _ = saved_frm;
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    fn quantize_absmax_i8_rvv(out_i8: &mut [i8], input: &[f32]) -> Option<f32> {
+        if input.is_empty() || out_i8.len() != input.len() {
+            return None;
+        }
+        let scale = Self::quantize_absmax_i8_rvv_find_max(input)?;
+        Self::quantize_absmax_i8_rvv_store(out_i8, input, scale);
+        Some(scale)
     }
 
     #[cfg(not(feature = "with-kernels"))]
@@ -1300,9 +1544,29 @@ impl BitNetRecipe {
     ) -> Result<(), K3Error> {
         #[cfg(feature = "with-kernels")]
         {
-            let _ = scores;
-            gqa_causal_attention_f32(
-                out, q, k_cache, v_cache, n_heads_q, n_heads_kv, head_dim, seq_len, scale,
+            if scores.len() < seq_len {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "gqa_scores".to_owned(),
+                    offset: 0,
+                    byte_len: seq_len * size_of::<f32>(),
+                    buffer_len: size_of_val(scores),
+                    reason: format!(
+                        "GQA scores scratch len {} < seq_len {seq_len}",
+                        scores.len()
+                    ),
+                });
+            }
+            gqa_causal_attention_with_scratch_f32(
+                out,
+                q,
+                k_cache,
+                v_cache,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                seq_len,
+                scale,
+                &mut scores[..seq_len],
             )
         }
         #[cfg(not(feature = "with-kernels"))]
@@ -1413,17 +1677,125 @@ impl BitNetRecipe {
         Ok(())
     }
 
+    pub(crate) fn apply_rope_heads_with_cos_sin(
+        vecs: &mut [f32],
+        head_d_even: usize,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<(), K3Error> {
+        if head_d_even < 2 || head_d_even % 2 != 0 || vecs.len() % head_d_even != 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "rope_qk".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(vecs),
+                buffer_len: head_d_even,
+                reason: format!(
+                    "invalid RoPE buffer len {} for head_d_even {head_d_even}",
+                    vecs.len()
+                ),
+            });
+        }
+        let num_heads = vecs.len() / head_d_even;
+        #[cfg(feature = "with-kernels")]
+        {
+            apply_rope_with_cos_sin(
+                vecs,
+                num_heads,
+                head_d_even,
+                head_d_even,
+                RopeType::NeoX,
+                cos,
+                sin,
+            )
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            let _ = num_heads;
+            let half = head_d_even / 2;
+            if cos.len() != half || sin.len() != half {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "rope_cos_sin".to_owned(),
+                    offset: 0,
+                    byte_len: size_of_val(cos),
+                    buffer_len: size_of_val(sin),
+                    reason: "cos/sin table lengths must equal head_d_even / 2".to_owned(),
+                });
+            }
+            for head in vecs.chunks_exact_mut(head_d_even) {
+                for i in 0..half {
+                    let c = cos[i];
+                    let s = sin[i];
+                    let (x1, x2) = (head[i], head[i + half]);
+                    head[i] = x1 * c - x2 * s;
+                    head[i + half] = x1 * s + x2 * c;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(not(feature = "with-kernels"))]
+    fn compute_rope_cos_sin_scalar(
+        position: usize,
+        rope_theta: f32,
+        head_d_even: usize,
+        cos: &mut [f32],
+        sin: &mut [f32],
+    ) {
+        if position == 0 {
+            cos.fill(1.0);
+            sin.fill(0.0);
+            return;
+        }
+        let half = head_d_even / 2;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "position and head indices fit comfortably in f32"
+        )]
+        {
+            let pos_f32 = position as f32;
+            for i in 0..half {
+                let freq = 1.0 / rope_theta.powf((2 * i) as f32 / head_d_even as f32);
+                let angle = pos_f32 * freq;
+                sin[i] = angle.sin();
+                cos[i] = angle.cos();
+            }
+        }
+    }
+
     /// Projects normalized final `hidden` state through `output.weight` or tied `token_embd.weight`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "handles tied embeddings, ternary absmax dispatch, and exact f32 row dot products"
-    )]
     pub(crate) fn project_lm_head(
         &self,
         logits: &mut [f32],
         hidden: &[f32],
         token_seed: Option<u32>,
         weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        if logits.is_empty() {
+            return Ok(());
+        }
+        let need_bytes = aligned_scratch_slot_bytes(size_of::<f32>(), hidden.len().max(1))
+            + aligned_scratch_slot_bytes(1, hidden.len().max(1))
+            + 256;
+        let mut ws = ScratchWorkspace::new(need_bytes)?;
+        let scope = ws.scope();
+        self.project_lm_head_with_scope(logits, hidden, token_seed, weights, None, &scope)
+    }
+
+    /// Projects normalized final `hidden` state through `output.weight` or tied `token_embd.weight`
+    /// using caller-provided `scope` scratch (zero heap allocations).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "handles tied embeddings, ternary absmax dispatch, and exact f32 row dot products"
+    )]
+    pub(crate) fn project_lm_head_with_scope(
+        &self,
+        logits: &mut [f32],
+        hidden: &[f32],
+        token_seed: Option<u32>,
+        weights: &dyn ModelWeights,
+        pool: Option<&DecodeWorkerPool>,
+        scope: &ScratchScope<'_>,
     ) -> Result<(), K3Error> {
         if logits.is_empty() {
             return Ok(());
@@ -1472,19 +1844,19 @@ impl BitNetRecipe {
 
         match head_weight.quant() {
             QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::I2_S => {
-                let mut act_head_i8 = vec![0_i8; hidden.len()];
-                let scale_head = Self::quantize_absmax_i8(&mut act_head_i8, hidden)?;
-                Self::dispatch_bitlinear(logits, &head_weight, &act_head_i8, scale_head)
+                let act_head_i8 = scope.alloc_i8_zeroed(hidden.len())?;
+                let scale_head = Self::quantize_absmax_i8(act_head_i8, hidden)?;
+                Self::dispatch_bitlinear(logits, &head_weight, act_head_i8, scale_head)
             }
             QuantType::F32 | QuantType::F16 | QuantType::BF16 | QuantType::Q8_0 => {
                 let total_rows =
                     Self::matrix_row_col_dims(&head_weight, hidden.len(), logits.len())?;
                 #[cfg(feature = "with-kernels")]
                 {
-                    let _ = total_rows;
-                    let mut row_buf = vec![0.0_f32; hidden.len()];
+                    let _ = (total_rows, pool);
+                    let row_buf = scope.alloc_f32_zeroed(hidden.len())?;
                     for (r, slot) in logits.iter_mut().enumerate() {
-                        dequantize_tensor_row(&head_weight, r, &mut row_buf)?;
+                        dequantize_tensor_row(&head_weight, r, row_buf)?;
                         *slot = row_buf.iter().zip(hidden).map(|(&w, &h)| w * h).sum();
                     }
                     Ok(())
@@ -1534,10 +1906,24 @@ impl BitNetRecipe {
                             });
                         }
                     }
-                    for (r, slot) in logits.iter_mut().enumerate() {
-                        *slot = Self::dot_row_f32_scalar(&head_weight, r, total_rows, hidden)?;
+                    if let Some(worker_pool) = pool {
+                        worker_pool.par_for_each_rows(logits, 8, |row_off, chunk| {
+                            for (local_r, slot) in chunk.iter_mut().enumerate() {
+                                *slot = Self::dot_row_f32_scalar(
+                                    &head_weight,
+                                    row_off + local_r,
+                                    total_rows,
+                                    hidden,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    } else {
+                        for (r, slot) in logits.iter_mut().enumerate() {
+                            *slot = Self::dot_row_f32_scalar(&head_weight, r, total_rows, hidden)?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
                 }
             }
             other => Err(K3Error::TensorBoundsError {
@@ -1550,14 +1936,93 @@ impl BitNetRecipe {
         }
     }
 
-    /// Executes forward layer kernels for a single token seed at `position`.
+    /// Computes the conservative `128-byte`-aligned [`ScratchWorkspace`] capacity (in bytes)
+    /// needed for zero-allocation single-token `decode_step` execution up to `max_seq_len`.
+    #[must_use]
+    pub const fn decode_scratch_bytes(&self, max_seq_len: usize) -> usize {
+        let hidden_dim = if self.hidden_dim > 16 {
+            self.hidden_dim
+        } else {
+            16
+        };
+        let ffn_dim = if self.ffn_dim > 16 { self.ffn_dim } else { 16 };
+        let head_d = if self.head_dim > 2 { self.head_dim } else { 2 };
+        let head_d_even = if head_d % 2 == 0 { head_d } else { head_d - 1 };
+        let n_q = if self.n_heads_q > 1 {
+            self.n_heads_q
+        } else {
+            1
+        };
+        let n_kv = if self.n_heads_kv > 1 {
+            self.n_heads_kv
+        } else {
+            1
+        };
+        let total_q = n_q.saturating_mul(head_d_even);
+        let total_kv = n_kv.saturating_mul(head_d_even);
+        let seq_cap = if max_seq_len > 1 { max_seq_len } else { 1 };
+        let max_k = {
+            let m1 = if hidden_dim > total_q {
+                hidden_dim
+            } else {
+                total_q
+            };
+            if m1 > ffn_dim { m1 } else { ffn_dim }
+        };
+        let max_a_tiles = max_k.div_ceil(256).saturating_mul(16).saturating_mul(128);
+        let hidden_bytes = aligned_scratch_slot_bytes(4, hidden_dim);
+
+        let phase_a = aligned_scratch_slot_bytes(4, hidden_dim)
+            + aligned_scratch_slot_bytes(4, total_q)
+            + aligned_scratch_slot_bytes(4, ffn_dim)
+            + aligned_scratch_slot_bytes(4, total_q)
+            + aligned_scratch_slot_bytes(4, total_kv)
+            + aligned_scratch_slot_bytes(4, total_kv)
+            + aligned_scratch_slot_bytes(4, total_q)
+            + aligned_scratch_slot_bytes(4, seq_cap)
+            + aligned_scratch_slot_bytes(4, hidden_dim)
+            + aligned_scratch_slot_bytes(4, ffn_dim)
+            + aligned_scratch_slot_bytes(4, ffn_dim)
+            + aligned_scratch_slot_bytes(4, ffn_dim)
+            + aligned_scratch_slot_bytes(4, hidden_dim)
+            + aligned_scratch_slot_bytes(1, hidden_dim)
+            + aligned_scratch_slot_bytes(1, total_q)
+            + aligned_scratch_slot_bytes(1, ffn_dim)
+            + aligned_scratch_slot_bytes(1, max_a_tiles)
+            + aligned_scratch_slot_bytes(4, head_d_even / 2)
+            + aligned_scratch_slot_bytes(4, head_d_even / 2);
+
+        let head_a_tiles = hidden_dim
+            .div_ceil(256)
+            .saturating_mul(16)
+            .saturating_mul(128);
+        #[cfg(feature = "with-kernels")]
+        let head_view_bytes = QuantizedActQ8View::scratch_bytes_for_row(hidden_dim);
+        #[cfg(not(feature = "with-kernels"))]
+        let head_view_bytes = 0_usize;
+        let base_phase_b = aligned_scratch_slot_bytes(1, hidden_dim)
+            + aligned_scratch_slot_bytes(1, head_a_tiles)
+            + aligned_scratch_slot_bytes(4, hidden_dim.div_ceil(32))
+            + aligned_scratch_slot_bytes(4, hidden_dim)
+            + aligned_scratch_slot_bytes(1, hidden_dim.div_ceil(32).saturating_mul(512) + 2048);
+        let phase_b = if base_phase_b > head_view_bytes {
+            base_phase_b
+        } else {
+            head_view_bytes
+        };
+
+        hidden_bytes + phase_a + phase_b + 512
+    }
+
+    /// Executes forward layer kernels for a single token seed at `position` using `128-byte`
+    /// [`ScratchScope`] buffers without dynamic heap allocations inside the decode loop.
     #[allow(clippy::needless_range_loop, clippy::manual_checked_ops)]
     #[expect(
         clippy::too_many_lines,
-        clippy::similar_names,
-        reason = "sequential layer loop with 7 BitLinear projections and SubLN"
+        clippy::too_many_arguments,
+        reason = "sequential layer loop with 7 BitLinear projections, deduplicated SubLN, and precomputed RoPE scratch"
     )]
-    fn execute_token_step(
+    pub(crate) fn execute_token_step_with_scratch(
         &self,
         token_id: u32,
         position: usize,
@@ -1565,7 +2030,9 @@ impl BitNetRecipe {
         kv_storage: &mut KvStorage<'_>,
         weights: &dyn ModelWeights,
         mut cache: Option<&mut BitNetModelCache>,
-    ) -> Result<Vec<f32>, K3Error> {
+        hidden: &mut [f32],
+        scope: &ScratchScope<'_>,
+    ) -> Result<(), K3Error> {
         let hidden_dim = self.hidden_dim.max(16);
         let ffn_dim = self.ffn_dim.max(16);
         let head_d = self.head_dim.max(2);
@@ -1578,140 +2045,140 @@ impl BitNetRecipe {
         #[expect(clippy::cast_precision_loss, reason = "head dimension fits in f32")]
         let attn_scale = 1.0 / (head_d_even as f32).sqrt();
         let max_seq_alloc = seq_len.max(position.saturating_add(1)).max(1);
+        let max_k = hidden_dim.max(total_q).max(ffn_dim);
+        let a_tiles_len = max_k.div_ceil(256) * 16 * 128;
+        let rope_half = head_d_even / 2;
 
-        // Pre-allocate scratch buffers once OUTSIDE the layer loop:
-        let mut hidden = vec![0.0_f32; hidden_dim];
-        Self::embed_token_opt(cache.as_deref_mut(), weights, token_id, &mut hidden)?;
+        if hidden.len() != hidden_dim {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "hidden_scratch".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(hidden),
+                buffer_len: hidden_dim * size_of::<f32>(),
+                reason: format!(
+                    "hidden scratch len {} != expected hidden_dim {hidden_dim}",
+                    hidden.len()
+                ),
+            });
+        }
+        Self::embed_token_opt(cache.as_deref_mut(), weights, token_id, hidden)?;
 
-        // Fixed buffers for layer projections (ZERO heap allocations during layer loop)
-        let mut norm_w_hidden = vec![1.0_f32; hidden_dim];
-        let mut norm_w_total_q = vec![1.0_f32; total_q];
-        let mut norm_w_ffn = vec![1.0_f32; ffn_dim];
+        // Allocate all 128-byte-aligned layer scratch slices ONCE outside the layer loop:
+        let norm_w_hidden = scope.alloc_f32_zeroed(hidden_dim)?;
+        let norm_w_total_q = scope.alloc_f32_zeroed(total_q)?;
+        let norm_w_ffn = scope.alloc_f32_zeroed(ffn_dim)?;
 
-        let mut act_q_i8 = vec![0_i8; hidden_dim];
-        let mut act_k_i8 = vec![0_i8; hidden_dim];
-        let mut act_v_i8 = vec![0_i8; hidden_dim];
+        let q_vec = scope.alloc_f32_zeroed(total_q)?;
+        let k_vec = scope.alloc_f32_zeroed(total_kv)?;
+        let v_vec = scope.alloc_f32_zeroed(total_kv)?;
 
-        let mut q_vec = vec![0.0_f32; total_q];
-        let mut k_vec = vec![0.0_f32; total_kv];
-        let mut v_vec = vec![0.0_f32; total_kv];
+        let attn_out = scope.alloc_f32_zeroed(total_q)?;
+        let attn_scores = scope.alloc_f32_zeroed(max_seq_alloc)?;
+        let o_proj = scope.alloc_f32_zeroed(hidden_dim)?;
 
-        let mut attn_out = vec![0.0_f32; total_q];
-        let mut attn_scores = vec![0.0_f32; max_seq_alloc];
-        let mut act_out_i8 = vec![0_i8; total_q];
-        let mut o_proj = vec![0.0_f32; hidden_dim];
+        let gate = scope.alloc_f32_zeroed(ffn_dim)?;
+        let up = scope.alloc_f32_zeroed(ffn_dim)?;
+        let ffn_inter = scope.alloc_f32_zeroed(ffn_dim)?;
+        let d_proj = scope.alloc_f32_zeroed(hidden_dim)?;
 
-        let mut act_gate_i8 = vec![0_i8; hidden_dim];
-        let mut act_up_i8 = vec![0_i8; hidden_dim];
-        let mut gate = vec![0.0_f32; ffn_dim];
-        let mut up = vec![0.0_f32; ffn_dim];
-        let mut ffn_inter = vec![0.0_f32; ffn_dim];
+        let act_hidden_i8 = scope.alloc_i8_zeroed(hidden_dim)?;
+        let act_out_i8 = scope.alloc_i8_zeroed(total_q)?;
+        let act_down_i8 = scope.alloc_i8_zeroed(ffn_dim)?;
+        let a_tiles_i8 = scope.alloc_i8_zeroed(a_tiles_len)?;
 
-        let mut act_down_i8 = vec![0_i8; ffn_dim];
-        let mut d_proj = vec![0.0_f32; hidden_dim];
-
-        let mut name_buf = String::with_capacity(64);
+        let rope_cos = scope.alloc_f32_zeroed(rope_half)?;
+        let rope_sin = scope.alloc_f32_zeroed(rope_half)?;
+        #[cfg(feature = "with-kernels")]
+        compute_rope_cos_sin(position, self.rope_theta, 1.0, None, rope_cos, rope_sin)?;
+        #[cfg(not(feature = "with-kernels"))]
+        Self::compute_rope_cos_sin_scalar(
+            position,
+            self.rope_theta,
+            head_d_even,
+            rope_cos,
+            rope_sin,
+        );
 
         for layer in 0..self.num_layers {
             // -------------------------------------------------------------
             // 1. Pre-Attention Norm & Projections (attn_q, attn_k, attn_v)
             // -------------------------------------------------------------
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_norm.weight");
-            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_hidden)?;
+            let attn_norm_key = StackLayerKey::format(layer, "attn_norm.weight");
+            Self::load_norm_opt(
+                cache.as_deref_mut(),
+                weights,
+                attn_norm_key.as_str(),
+                norm_w_hidden,
+            )?;
 
-            // 1a. SubLN before attn_q
-            let scale_q = Self::subln(&mut act_q_i8, &hidden, &norm_w_hidden, eps)?;
-
-            // 1b. SubLN before attn_k
-            let scale_k = Self::subln(&mut act_k_i8, &hidden, &norm_w_hidden, eps)?;
-
-            // 1c. SubLN before attn_v
-            let scale_v = Self::subln(&mut act_v_i8, &hidden, &norm_w_hidden, eps)?;
+            // Deduplicated Pre-QKV SubLN pass shared cleanly by attn_q, attn_k, attn_v
+            let scale_qkv = Self::subln(act_hidden_i8, hidden, norm_w_hidden, eps)?;
 
             // BitLinear attn_q
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_q.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let q_key = StackLayerKey::format(layer, "attn_q.weight");
+            if weights.contains_tensor(q_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut q_vec,
-                    &act_q_i8,
-                    scale_q,
+                    q_key.as_str(),
+                    q_vec,
+                    act_hidden_i8,
+                    scale_qkv,
+                    a_tiles_i8,
                 )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in q_vec.iter_mut().enumerate() {
-                    *slot = (f32::from(act_q_i8[i % hidden_dim]) * scale_q) * 0.1 + 0.5;
+                    *slot = (f32::from(act_hidden_i8[i % hidden_dim]) * scale_qkv) * 0.1 + 0.5;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(q_key.as_str()));
             }
 
             // BitLinear attn_k
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_k.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let k_key = StackLayerKey::format(layer, "attn_k.weight");
+            if weights.contains_tensor(k_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut k_vec,
-                    &act_k_i8,
-                    scale_k,
+                    k_key.as_str(),
+                    k_vec,
+                    act_hidden_i8,
+                    scale_qkv,
+                    a_tiles_i8,
                 )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in k_vec.iter_mut().enumerate() {
-                    *slot = (f32::from(act_k_i8[i % hidden_dim]) * scale_k) * 0.1 + 0.5;
+                    *slot = (f32::from(act_hidden_i8[i % hidden_dim]) * scale_qkv) * 0.1 + 0.5;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(k_key.as_str()));
             }
 
             // BitLinear attn_v
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_v.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let v_key = StackLayerKey::format(layer, "attn_v.weight");
+            if weights.contains_tensor(v_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut v_vec,
-                    &act_v_i8,
-                    scale_v,
+                    v_key.as_str(),
+                    v_vec,
+                    act_hidden_i8,
+                    scale_qkv,
+                    a_tiles_i8,
                 )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in v_vec.iter_mut().enumerate() {
-                    *slot = (f32::from(act_v_i8[i % hidden_dim]) * scale_v) * 0.1 + 0.5;
+                    *slot = (f32::from(act_hidden_i8[i % hidden_dim]) * scale_qkv) * 0.1 + 0.5;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(v_key.as_str()));
             }
 
             // -------------------------------------------------------------
             // 2. Rotary Position Embeddings (RoPE)
             // -------------------------------------------------------------
-            self.apply_rope_heads(&mut q_vec, head_d_even, position, seq_len)?;
-            self.apply_rope_heads(&mut k_vec, head_d_even, position, seq_len)?;
+            Self::apply_rope_heads_with_cos_sin(q_vec, head_d_even, rope_cos, rope_sin)?;
+            Self::apply_rope_heads_with_cos_sin(k_vec, head_d_even, rope_cos, rope_sin)?;
 
             // -------------------------------------------------------------
             // 3. KV Cache Residency & Causal Attention (GQA)
@@ -1720,30 +2187,19 @@ impl BitNetRecipe {
             match kv_storage {
                 KvStorage::View(kv_view) => {
                     if kv_view.kv_dim() != total_kv {
-                        name_buf.clear();
-                        let _ = write!(&mut name_buf, "kv_cache.layer.{layer}");
-                        return Err(K3Error::TensorBoundsError {
-                            tensor_name: name_buf.clone(),
-                            offset: 0,
-                            byte_len: total_kv * size_of::<f32>(),
-                            buffer_len: kv_view.kv_dim() * size_of::<f32>(),
-                            reason: format!(
-                                "KvGeometry kv_dim {} does not match total_kv {total_kv}",
-                                kv_view.kv_dim()
-                            ),
-                        });
+                        return Err(kv_dim_mismatch_error(layer, total_kv, kv_view.kv_dim()));
                     }
                     let (k_slot, v_slot) = kv_view.write_pos_range(layer, position)?;
-                    k_slot.copy_from_slice(&k_vec);
-                    v_slot.copy_from_slice(&v_vec);
+                    k_slot.copy_from_slice(k_vec);
+                    v_slot.copy_from_slice(v_vec);
                     let (k_hist, v_hist) = kv_view.valid_kv_range(layer, position + 1)?;
                     let active_seq_len = k_hist.len() / total_kv;
                     Self::dispatch_gqa_attention(
-                        &mut attn_out,
-                        &q_vec,
+                        attn_out,
+                        q_vec,
                         k_hist,
                         v_hist,
-                        &mut attn_scores,
+                        attn_scores,
                         n_q,
                         n_kv,
                         head_d_even,
@@ -1759,17 +2215,17 @@ impl BitNetRecipe {
                         let layer_start = layer * layer_stride;
                         let layer_buf = &mut kv_cache[layer_start..layer_start + layer_stride];
                         let write_off = position * total_kv;
-                        layer_buf[write_off..write_off + total_kv].copy_from_slice(&k_vec);
+                        layer_buf[write_off..write_off + total_kv].copy_from_slice(k_vec);
                         layer_buf[half_stride + write_off..half_stride + write_off + total_kv]
-                            .copy_from_slice(&v_vec);
+                            .copy_from_slice(v_vec);
                         let k_hist = &layer_buf[..req_hist_elems];
                         let v_hist = &layer_buf[half_stride..half_stride + req_hist_elems];
                         Self::dispatch_gqa_attention(
-                            &mut attn_out,
-                            &q_vec,
+                            attn_out,
+                            q_vec,
                             k_hist,
                             v_hist,
-                            &mut attn_scores,
+                            attn_scores,
                             n_q,
                             n_kv,
                             head_d_even,
@@ -1791,11 +2247,11 @@ impl BitNetRecipe {
                                 .copy_from_slice(&v_vec[..actual_copy]);
                         }
                         Self::dispatch_gqa_attention(
-                            &mut attn_out,
-                            &q_vec,
-                            &k_vec,
-                            &v_vec,
-                            &mut attn_scores,
+                            attn_out,
+                            q_vec,
+                            k_vec,
+                            v_vec,
+                            attn_scores,
                             n_q,
                             n_kv,
                             head_d_even,
@@ -1803,17 +2259,13 @@ impl BitNetRecipe {
                             attn_scale,
                         )?;
                     } else {
-                        name_buf.clear();
-                        let _ = write!(&mut name_buf, "kv_cache");
-                        return Err(K3Error::TensorBoundsError {
-                            tensor_name: name_buf.clone(),
-                            offset: 0,
-                            byte_len: req_hist_elems * 2 * self.num_layers * size_of::<f32>(),
-                            buffer_len: size_of_val(*kv_cache),
-                            reason: format!(
-                                "kv_cache half-layer stride {half_stride} is smaller than required {req_hist_elems} elements for position {position}"
-                            ),
-                        });
+                        return Err(kv_stride_error(
+                            req_hist_elems,
+                            self.num_layers,
+                            size_of_val(*kv_cache),
+                            half_stride,
+                            position,
+                        ));
                     }
                 }
             }
@@ -1821,31 +2273,30 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             // 4. SubLN before Output Projection & Residual Connection
             // -------------------------------------------------------------
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_sub_norm.weight");
+            let attn_sub_key = StackLayerKey::format(layer, "attn_sub_norm.weight");
             Self::load_norm_opt(
                 cache.as_deref_mut(),
                 weights,
-                &name_buf,
-                &mut norm_w_total_q,
+                attn_sub_key.as_str(),
+                norm_w_total_q,
             )?;
 
             // 4a. Mandatory SubLN before attn_output
-            let scale_out = Self::subln(&mut act_out_i8, &attn_out, &norm_w_total_q, eps)?;
+            let scale_out = Self::subln(act_out_i8, attn_out, norm_w_total_q, eps)?;
 
             // 4b. BitLinear attn_output
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.attn_output.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let o_key = StackLayerKey::format(layer, "attn_output.weight");
+            if weights.contains_tensor(o_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut o_proj,
-                    &act_out_i8,
+                    o_key.as_str(),
+                    o_proj,
+                    act_out_i8,
                     scale_out,
+                    a_tiles_i8,
                 )?;
-                for (h, o) in hidden.iter_mut().zip(&o_proj) {
+                for (h, o) in hidden.iter_mut().zip(o_proj.iter()) {
                     *h += *o;
                 }
             } else if weights.tensor_count() == 0 {
@@ -1853,78 +2304,61 @@ impl BitNetRecipe {
                     *h += (f32::from(act_out_i8[i % total_q]) * scale_out) * 0.05;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(o_key.as_str()));
             }
 
             // -------------------------------------------------------------
             // 5. FFN Norm & Projections (ffn_gate, ffn_up)
             // -------------------------------------------------------------
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.ffn_norm.weight");
-            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_hidden)?;
+            let ffn_norm_key = StackLayerKey::format(layer, "ffn_norm.weight");
+            Self::load_norm_opt(
+                cache.as_deref_mut(),
+                weights,
+                ffn_norm_key.as_str(),
+                norm_w_hidden,
+            )?;
 
-            // 5a. Mandatory SubLN before ffn_gate
-            let scale_gate = Self::subln(&mut act_gate_i8, &hidden, &norm_w_hidden, eps)?;
-
-            // 5b. Mandatory SubLN before ffn_up
-            let scale_up = Self::subln(&mut act_up_i8, &hidden, &norm_w_hidden, eps)?;
+            // Deduplicated Pre-FFN SubLN pass shared cleanly by ffn_gate and ffn_up
+            let scale_ffn = Self::subln(act_hidden_i8, hidden, norm_w_hidden, eps)?;
 
             // BitLinear ffn_gate
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.ffn_gate.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let gate_key = StackLayerKey::format(layer, "ffn_gate.weight");
+            if weights.contains_tensor(gate_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut gate,
-                    &act_gate_i8,
-                    scale_gate,
+                    gate_key.as_str(),
+                    gate,
+                    act_hidden_i8,
+                    scale_ffn,
+                    a_tiles_i8,
                 )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in gate.iter_mut().enumerate() {
-                    *slot = (f32::from(act_gate_i8[i % hidden_dim]) * scale_gate) * 0.1 + 0.5;
+                    *slot = (f32::from(act_hidden_i8[i % hidden_dim]) * scale_ffn) * 0.1 + 0.5;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(gate_key.as_str()));
             }
 
             // BitLinear ffn_up
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.ffn_up.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let up_key = StackLayerKey::format(layer, "ffn_up.weight");
+            if weights.contains_tensor(up_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut up,
-                    &act_up_i8,
-                    scale_up,
+                    up_key.as_str(),
+                    up,
+                    act_hidden_i8,
+                    scale_ffn,
+                    a_tiles_i8,
                 )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in up.iter_mut().enumerate() {
-                    *slot = (f32::from(act_up_i8[i % hidden_dim]) * scale_up) * 0.05 + 0.25;
+                    *slot = (f32::from(act_hidden_i8[i % hidden_dim]) * scale_ffn) * 0.05 + 0.25;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(up_key.as_str()));
             }
 
             // -------------------------------------------------------------
@@ -1933,7 +2367,7 @@ impl BitNetRecipe {
             if self.use_relu2 {
                 #[cfg(feature = "with-kernels")]
                 {
-                    relu_squared_gate_f32(&mut ffn_inter, &gate, &up)?;
+                    relu_squared_gate_f32(ffn_inter, gate, up)?;
                 }
                 #[cfg(not(feature = "with-kernels"))]
                 {
@@ -1945,7 +2379,7 @@ impl BitNetRecipe {
             } else {
                 #[cfg(feature = "with-kernels")]
                 {
-                    swiglu_f32(&mut ffn_inter, &gate, &up)?;
+                    swiglu_f32(ffn_inter, gate, up)?;
                 }
                 #[cfg(not(feature = "with-kernels"))]
                 {
@@ -1966,26 +2400,30 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             // 7. SubLN before Down Projection & Residual Connection
             // -------------------------------------------------------------
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.ffn_sub_norm.weight");
-            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_ffn)?;
+            let ffn_sub_key = StackLayerKey::format(layer, "ffn_sub_norm.weight");
+            Self::load_norm_opt(
+                cache.as_deref_mut(),
+                weights,
+                ffn_sub_key.as_str(),
+                norm_w_ffn,
+            )?;
 
             // 7a. Mandatory SubLN before ffn_down
-            let scale_down = Self::subln(&mut act_down_i8, &ffn_inter, &norm_w_ffn, eps)?;
+            let scale_down = Self::subln(act_down_i8, ffn_inter, norm_w_ffn, eps)?;
 
             // 7b. BitLinear ffn_down
-            name_buf.clear();
-            let _ = write!(&mut name_buf, "blk.{layer}.ffn_down.weight");
-            if weights.contains_tensor(&name_buf) {
-                Self::dispatch_proj_opt(
+            let down_key = StackLayerKey::format(layer, "ffn_down.weight");
+            if weights.contains_tensor(down_key.as_str()) {
+                Self::dispatch_proj_with_a_tiles_opt(
                     cache.as_deref_mut(),
                     weights,
-                    &name_buf,
-                    &mut d_proj,
-                    &act_down_i8,
+                    down_key.as_str(),
+                    d_proj,
+                    act_down_i8,
                     scale_down,
+                    a_tiles_i8,
                 )?;
-                for (h, d) in hidden.iter_mut().zip(&d_proj) {
+                for (h, d) in hidden.iter_mut().zip(d_proj.iter()) {
                     *h += *d;
                 }
             } else if weights.tensor_count() == 0 {
@@ -1993,13 +2431,7 @@ impl BitNetRecipe {
                     *h += (f32::from(act_down_i8[i % ffn_dim]) * scale_down) * 0.01;
                 }
             } else {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: name_buf.clone(),
-                    offset: 0,
-                    byte_len: 0,
-                    buffer_len: 0,
-                    reason: format!("tensor '{name_buf}' not found in weights"),
-                });
+                return Err(missing_tensor_error(down_key.as_str()));
             }
         }
 
@@ -2007,7 +2439,7 @@ impl BitNetRecipe {
         // 8. Output Normalization
         // -------------------------------------------------------------
         if weights.contains_tensor("output_norm.weight") {
-            Self::load_norm_opt(cache, weights, "output_norm.weight", &mut norm_w_hidden)?;
+            Self::load_norm_opt(cache, weights, "output_norm.weight", norm_w_hidden)?;
             let sum_sq: f32 = hidden.iter().map(|&x| x * x).sum();
             if sum_sq.is_finite() {
                 #[expect(clippy::cast_precision_loss, reason = "dimension fits in f32")]
@@ -2023,44 +2455,10 @@ impl BitNetRecipe {
                 hidden.fill(0.0);
             }
         } else if weights.tensor_count() > 0 {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "output_norm.weight".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "tensor 'output_norm.weight' not found in weights".to_owned(),
-            });
+            return Err(missing_tensor_error("output_norm.weight"));
         }
 
-        Ok(hidden)
-    }
-
-    pub(crate) fn run_tokens_with_cache(
-        &self,
-        tokens: &[u32],
-        start_pos: usize,
-        seq_len: usize,
-        ctx: &mut ExecutionContext<'_>,
-        weights: &dyn ModelWeights,
-        mut cache: Option<&mut BitNetModelCache>,
-    ) -> Result<Vec<f32>, K3Error> {
-        let mut last_hidden = Vec::new();
-        let mut kv_storage = match ctx.kv_view_mut() {
-            Some(view) => KvStorage::View(view),
-            None => KvStorage::Raw(ctx.kv_cache_mut()),
-        };
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = start_pos + i;
-            last_hidden = self.execute_token_step(
-                tok,
-                pos,
-                seq_len,
-                &mut kv_storage,
-                weights,
-                cache.as_deref_mut(),
-            )?;
-        }
-        Ok(last_hidden)
+        Ok(())
     }
 
     fn validate_dimensions(&self, metadata: &ModelMetadata) -> Result<(), K3Error> {
@@ -2263,5 +2661,76 @@ impl ArchRecipe for BitNetRecipe {
         } else {
             self.decode_step_with_opt_cache(ctx, weights, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoWeights;
+
+    impl ModelWeights for NoWeights {
+        fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+            Err(missing_tensor_error(name))
+        }
+
+        fn tensor_count(&self) -> usize {
+            0
+        }
+
+        fn total_weight_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_stack_layer_key_formats_without_heap() {
+        assert_eq!(
+            StackLayerKey::format(0, "attn_q.weight").as_str(),
+            "blk.0.attn_q.weight"
+        );
+        assert_eq!(
+            StackLayerKey::format(31, "ffn_norm.weight").as_str(),
+            "blk.31.ffn_norm.weight"
+        );
+        assert_eq!(
+            StackLayerKey::format(128, "ffn_down.weight").as_str(),
+            "blk.128.ffn_down.weight"
+        );
+        let max_key = StackLayerKey::format(usize::MAX, "attn_norm.weight");
+        assert!(max_key.as_str().starts_with("blk."));
+        assert!(max_key.as_str().ends_with(".attn_norm.weight"));
+    }
+
+    #[test]
+    fn test_decode_scratch_bytes_tight_budget_succeeds_across_seq_lengths() {
+        let mut recipe = BitNetRecipe::new();
+        recipe.num_layers = 1;
+        recipe.hidden_dim = 16;
+        recipe.ffn_dim = 32;
+        recipe.n_heads_q = 2;
+        recipe.n_heads_kv = 2;
+        recipe.head_dim = 8;
+        recipe.vocab_size = 8;
+
+        let short_bytes = recipe.decode_scratch_bytes(4);
+        let long_bytes = recipe.decode_scratch_bytes(4096);
+        assert!(long_bytes > short_bytes);
+
+        let prompt = [1_u32, 2];
+        let mut logits = [0.0_f32; 8];
+        let mut kv_buf = [0.0_f32; 128];
+        let mut ws = ScratchWorkspace::new(short_bytes).expect("valid tight ScratchWorkspace");
+        let mut ctx = ExecutionContext::new(&prompt, 4, &mut logits, &mut kv_buf)
+            .expect("ctx")
+            .with_scratch(&mut ws);
+        let weights = NoWeights;
+        recipe.prefill_step(&mut ctx, &weights).expect("prefill");
+        ctx.prepare_decode(3).expect("prepare decode");
+        recipe
+            .decode_step(&mut ctx, &weights)
+            .expect("decode with exact tight scratch budget succeeds");
+        assert_eq!(ctx.position(), 3);
     }
 }

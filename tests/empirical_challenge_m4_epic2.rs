@@ -15,7 +15,9 @@
 )]
 
 use jero_arch_bitnet::BitNetRecipe;
-use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+use jero_core::{
+    ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, ScratchWorkspace, TensorView,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -646,36 +648,36 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
 
         let mut logits = vec![0.0f32; 16];
         let mut kv_cache = vec![0.0f32; 8192 * num_layers];
+        let mut scratch = ScratchWorkspace::new(recipe.decode_scratch_bytes(32))
+            .expect("allocate decode ScratchWorkspace");
         let prompt = [1u32];
-        let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv_cache).unwrap();
+        let mut ctx = ExecutionContext::new(&prompt, 32, &mut logits, &mut kv_cache)
+            .unwrap()
+            .with_scratch(&mut scratch);
         ctx.prepare_decode(42).expect("prepare decode");
 
         // Measure allocations during decode_step (which executes 1 token step through the layer loop)
-        let (_res, count) = measure_allocations(|| recipe.decode_step(&mut ctx, &weights));
+        let (res, count) = measure_allocations(|| recipe.decode_step(&mut ctx, &weights));
+        assert!(res.is_ok(), "decode_step must succeed: {res:?}");
 
         alloc_counts.push(count);
     }
 
     println!("=== Zero Allocation Invariant Empirical Results ===");
     for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
-        println!("Layers: {layers} -> Allocations in execute_token_step: {count}");
+        println!("Layers: {layers} -> Allocations in decode_step: {count}");
     }
 
-    // Verify allocation behavior:
-    // In execute_token_step, recipe.rs preallocates 22 scratch slices once outside the layer loop.
-    // decode_step adds 1 scratch slice in the ternary LM head for absmax quantization, yielding
-    // 23 fixed allocations outside the loop.
+    // Verify strictly zero heap allocations across the entire decode step when ScratchWorkspace is attached:
     for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
         assert_eq!(
-            count, 23,
-            "Allocation count for {layers} layers must remain 23 \
-             (22 pre-allocated scratch buffers in execute_token_step + 1 in decode_step LM head; \
-             upstream gqa_causal_attention_f32 uses stack scratch for seq_len <= 2048). \
-             d(Allocations)/d(layers) must be strictly 0."
+            count, 0,
+            "Steady-state BitNetRecipe::decode_step with attached ScratchWorkspace for {layers} \
+             layers must perform strictly 0 heap allocations (saw {count})."
         );
     }
     println!(
-        "PASS: d(Allocations)/d(layers) == 0 across all tested depths. Zero heap allocations occur inside the layer loop."
+        "PASS: d(Allocations)/d(layers) == 0 and total decode_step allocations == 0 across all tested depths."
     );
 }
 
