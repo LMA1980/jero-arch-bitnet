@@ -4,20 +4,23 @@
 
 use crate::recipe::BitNetRecipe;
 use jero_core::{
-    ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, ModelWeights, QuantType, TensorView,
+    ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, ModelWeights, QuantType,
+    ScratchScope, ScratchWorkspace, TensorView,
 };
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "with-kernels")]
 pub use jero_kernels_rvv::Aligned128;
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    QuantizedActQ8, RepackedWeight,
-    ime::{gemm_i8_ime, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8},
+    QuantizedActQ8View, RepackedWeight,
+    ime::{unpack_tq1_0_block_i8, unpack_tq2_0_block_i8},
     quant::{read_i2_s_trailer_scale, unpack_i2_s_block_i8},
 };
 
@@ -491,6 +494,347 @@ fn validate_token_in_vocab(
     Ok(())
 }
 
+/// Returns the default decode worker partition count for host/target execution (`1..=8`).
+///
+/// Honors `BITNET_DECODE_WORKERS` when set to `1..=64`; returns `1` under Miri.
+#[must_use]
+pub fn default_decode_workers() -> usize {
+    #[cfg(miri)]
+    {
+        1
+    }
+    #[cfg(not(miri))]
+    {
+        if let Some(raw) = std::env::var_os("BITNET_DECODE_WORKERS")
+            && let Ok(text) = raw.into_string()
+            && let Ok(parsed) = text.trim().parse::<usize>()
+        {
+            return parsed.clamp(1, 64);
+        }
+        thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, 8)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SendOpPtr(*const ());
+
+// SAFETY: Only constructed inside `DecodeWorkerPool::par_for_each_rows` pointing to a stack-pinned
+// `F: Sync` closure while the caller blocks via `CompletionGuard` until all workers complete.
+unsafe impl Send for SendOpPtr {}
+// SAFETY: Shared only as `&F` where `F: Sync` for the scoped lifetime of a single dispatch.
+unsafe impl Sync for SendOpPtr {}
+
+#[derive(Clone, Copy)]
+struct PartitionTask {
+    row_offset: usize,
+    out_ptr: NonNull<f32>,
+    out_len: usize,
+}
+
+// SAFETY: Each `PartitionTask` targets a mutually disjoint mutable sub-slice created via
+// `slice::split_at_mut`, and the caller reclaims `output` only after `pending == 0`.
+unsafe impl Send for PartitionTask {}
+
+type WorkerThunk = unsafe fn(*const (), usize, NonNull<f32>, usize) -> Result<(), K3Error>;
+
+struct PoolState {
+    generation: u64,
+    shutdown: bool,
+    pending: usize,
+    next_task: usize,
+    op_ptr: SendOpPtr,
+    thunk: Option<WorkerThunk>,
+    tasks: Vec<PartitionTask>,
+    first_error: Option<K3Error>,
+    panicked: bool,
+}
+
+struct PoolShared {
+    state: Mutex<PoolState>,
+    work_cv: Condvar,
+    done_cv: Condvar,
+}
+
+struct CompletionGuard<'a> {
+    shared: &'a PoolShared,
+}
+
+impl Drop for CompletionGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while guard.pending > 0 {
+            guard = self
+                .shared
+                .done_cv
+                .wait(guard)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Reusable zero-allocation worker pool for deterministic row-parallel `M = 1` GEMV dispatch.
+pub struct DecodeWorkerPool {
+    workers: usize,
+    shared: Option<Arc<PoolShared>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl core::fmt::Debug for DecodeWorkerPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DecodeWorkerPool")
+            .field("workers", &self.workers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecodeWorkerPool {
+    /// Creates a zero-overhead single-threaded partition dispatcher (spawns no OS threads).
+    #[must_use]
+    pub const fn single() -> Self {
+        Self {
+            workers: 1,
+            shared: None,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Creates a reusable row-parallel dispatcher with `workers.clamp(1, 64)` partitions.
+    ///
+    /// Persistent helper threads (`workers - 1`) are spawned once up front so subsequent GEMV calls
+    /// run without heap allocation or thread-spawn overhead.
+    #[must_use]
+    pub fn new(workers: usize) -> Self {
+        let workers = workers.clamp(1, 64);
+        if workers == 1 {
+            return Self::single();
+        }
+        let bg_count = workers - 1;
+        let shared = Arc::new(PoolShared {
+            state: Mutex::new(PoolState {
+                generation: 0,
+                shutdown: false,
+                pending: 0,
+                next_task: 0,
+                op_ptr: SendOpPtr(core::ptr::null()),
+                thunk: None,
+                tasks: Vec::with_capacity(bg_count),
+                first_error: None,
+                panicked: false,
+            }),
+            work_cv: Condvar::new(),
+            done_cv: Condvar::new(),
+        });
+        let mut handles = Vec::with_capacity(bg_count);
+        for worker_idx in 0..bg_count {
+            let shared_ref = Arc::clone(&shared);
+            let Ok(handle) = thread::Builder::new()
+                .name(format!("bitnet-gemv-{worker_idx}"))
+                .spawn(move || Self::worker_loop(&shared_ref))
+            else {
+                // Fall back gracefully with however many threads launched cleanly.
+                break;
+            };
+            handles.push(handle);
+        }
+        if handles.is_empty() {
+            return Self::single();
+        }
+        Self {
+            workers: handles.len() + 1,
+            shared: Some(shared),
+            handles,
+        }
+    }
+
+    /// Configured number of row partitions (`>= 1`).
+    #[must_use]
+    pub const fn worker_count(&self) -> usize {
+        self.workers
+    }
+
+    fn worker_loop(shared: &PoolShared) {
+        let mut seen_gen = 0_u64;
+        loop {
+            let (task, op_ptr, thunk) = {
+                let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+                loop {
+                    if guard.shutdown {
+                        return;
+                    }
+                    if guard.generation != seen_gen && guard.next_task < guard.tasks.len() {
+                        let task = guard.tasks[guard.next_task];
+                        guard.next_task += 1;
+                        let op_ptr = guard.op_ptr;
+                        let thunk = guard.thunk;
+                        break (task, op_ptr, thunk);
+                    }
+                    seen_gen = guard.generation;
+                    guard = shared
+                        .work_cv
+                        .wait(guard)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+
+            let run_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(f) = thunk {
+                    // SAFETY: `CompletionGuard` keeps the caller's stack frame and `output` slice
+                    // alive until `pending` drops to `0`, and `task.out_ptr..+task.out_len` is a
+                    // unique disjoint sub-slice created by `split_at_mut`.
+                    unsafe { f(op_ptr.0, task.row_offset, task.out_ptr, task.out_len) }
+                } else {
+                    Ok(())
+                }
+            }));
+
+            let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            match run_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if guard.first_error.is_none() {
+                        guard.first_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    guard.panicked = true;
+                }
+            }
+            guard.pending = guard.pending.saturating_sub(1);
+            if guard.pending == 0 {
+                shared.done_cv.notify_all();
+            }
+        }
+    }
+
+    /// Executes `op(row_offset, out_chunk)` deterministically across up to [`Self::worker_count`]
+    /// contiguous partitions aligned to `chunk_align` rows without allocating heap memory.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`K3Error`] returned by any partition or reports worker panic failure.
+    pub fn par_for_each_rows<F>(
+        &self,
+        output: &mut [f32],
+        chunk_align: usize,
+        op: F,
+    ) -> Result<(), K3Error>
+    where
+        F: Fn(usize, &mut [f32]) -> Result<(), K3Error> + Sync,
+    {
+        unsafe fn invoke<F>(
+            op_ptr: *const (),
+            row_offset: usize,
+            out_ptr: NonNull<f32>,
+            out_len: usize,
+        ) -> Result<(), K3Error>
+        where
+            F: Fn(usize, &mut [f32]) -> Result<(), K3Error> + Sync,
+        {
+            // SAFETY: Caller keeps `&op` alive for the full duration of the dispatch and `out_ptr`
+            // points exclusively to this worker's non-overlapping sub-slice of length `out_len`.
+            let op_ref = unsafe { &*op_ptr.cast::<F>() };
+            // SAFETY: Disjoint mutable sub-slice originally split via `slice::split_at_mut`.
+            let slice = unsafe { core::slice::from_raw_parts_mut(out_ptr.as_ptr(), out_len) };
+            op_ref(row_offset, slice)
+        }
+
+        if output.is_empty() {
+            return Ok(());
+        }
+        let align = chunk_align.max(1);
+        let total_chunks = output.len().div_ceil(align);
+        let parts = self.workers.min(total_chunks);
+        let Some(shared) = &self.shared else {
+            return op(0, output);
+        };
+        if parts <= 1 {
+            return op(0, output);
+        }
+
+        let base_chunks = total_chunks / parts;
+        let rem_chunks = total_chunks % parts;
+        let head_chunks = base_chunks + usize::from(rem_chunks > 0);
+        let head_len = (head_chunks * align).min(output.len());
+        let (head_slice, mut rest) = output.split_at_mut(head_len);
+
+        let bg_tasks = parts - 1;
+        {
+            let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.tasks.clear();
+            let mut cur_offset = head_len;
+            for part_idx in 1..parts {
+                let p_chunks = base_chunks + usize::from(part_idx < rem_chunks);
+                let p_len = (p_chunks * align).min(rest.len());
+                let (part_slice, next_rest) = rest.split_at_mut(p_len);
+                rest = next_rest;
+                let out_ptr = NonNull::from(part_slice).cast::<f32>();
+                guard.tasks.push(PartitionTask {
+                    row_offset: cur_offset,
+                    out_ptr,
+                    out_len: p_len,
+                });
+                cur_offset += p_len;
+            }
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.pending = bg_tasks;
+            guard.next_task = 0;
+            guard.op_ptr = SendOpPtr(core::ptr::from_ref(&op).cast::<()>());
+            guard.thunk = Some(invoke::<F>);
+            guard.first_error = None;
+            guard.panicked = false;
+            shared.work_cv.notify_all();
+        }
+
+        let _wait_guard = CompletionGuard { shared };
+        let head_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(0, head_slice)));
+        let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while guard.pending > 0 {
+            guard = shared
+                .done_cv
+                .wait(guard)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if guard.panicked {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "DecodeWorkerPool".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "worker thread panicked during row-parallel GEMV".to_owned(),
+            });
+        }
+        match head_res {
+            Ok(Ok(())) => {
+                if let Some(err) = guard.first_error.take() {
+                    return Err(err);
+                }
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+impl Drop for DecodeWorkerPool {
+    fn drop(&mut self) {
+        if let Some(shared) = &self.shared {
+            let mut guard = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.shutdown = true;
+            shared.work_cv.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Pre-repacked `128-byte`-aligned `8x16` `i8` ternary / block-quantized projection matrix.
 ///
 /// Unpacks `TQ1_0`, `TQ2_0`, `I2_S`, and `Q8_0` weight blocks once at load time into `[n_tile][blk][k_chunk][8][16]`
@@ -547,12 +891,31 @@ impl BitLinearActScratch {
             self.a_tiles.resize(total_chunks, Aligned128::zeroed());
         }
         let dst = Aligned128::slice_as_i8_mut(&mut self.a_tiles[..total_chunks]);
-        for ch in 0..total_chunks {
-            let chunk = &act_i8[ch * TILE_K..(ch + 1) * TILE_K];
-            let ch_base = ch * TILE_BYTES;
-            dst[ch_base..ch_base + TILE_K].copy_from_slice(chunk);
-            dst[ch_base + TILE_K..ch_base + TILE_BYTES].fill(0);
+        prepare_a_tiles_slice(dst, act_i8, blocks_per_row, block_k_chunks);
+    }
+}
+
+pub(crate) fn prepare_a_tiles_slice(
+    dst: &mut [i8],
+    act_i8: &[i8],
+    blocks_per_row: usize,
+    block_k_chunks: usize,
+) {
+    let total_chunks = blocks_per_row * block_k_chunks;
+    for ch in 0..total_chunks {
+        let src_start = ch * TILE_K;
+        let ch_base = ch * TILE_BYTES;
+        if src_start + TILE_K <= act_i8.len() {
+            dst[ch_base..ch_base + TILE_K].copy_from_slice(&act_i8[src_start..src_start + TILE_K]);
+        } else {
+            let valid = act_i8.len().saturating_sub(src_start);
+            if valid > 0 {
+                dst[ch_base..ch_base + valid]
+                    .copy_from_slice(&act_i8[src_start..src_start + valid]);
+            }
+            dst[ch_base + valid..ch_base + TILE_K].fill(0);
         }
+        dst[ch_base + TILE_K..ch_base + TILE_BYTES].fill(0);
     }
 }
 
@@ -859,6 +1222,12 @@ impl RepackedTernaryMatrix {
         self.bitlinear_gemv_with_scratch(out, act_i8, act_scale, &mut scratch)
     }
 
+    /// Number of `i8` elements required in an activation tile buffer for GEMV (`blocks * chunks * 128`).
+    #[must_use]
+    pub const fn a_tiles_i8_len(&self) -> usize {
+        self.blocks_per_row * self.block_k_chunks * TILE_BYTES
+    }
+
     /// Executes `BitLinear` GEMV using a caller-owned reusable [`BitLinearActScratch`] buffer.
     ///
     /// # Errors
@@ -892,13 +1261,72 @@ impl RepackedTernaryMatrix {
 
         scratch.prepare_block_tiles(act_i8, self.blocks_per_row, self.block_k_chunks);
         let a_i8 = Aligned128::slice_as_i8(&scratch.a_tiles);
+        let used = self.a_tiles_i8_len();
+        self.eval_tile_range(out, 0, &a_i8[..used], act_scale);
+        Ok(())
+    }
+
+    /// Executes zero-allocation row-parallel `BitLinear` GEMV using caller-owned activation tile
+    /// scratch (`a_tiles_i8.len() >= self.a_tiles_i8_len()`) and [`DecodeWorkerPool`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on shape or scratch capacity mismatch.
+    pub fn bitlinear_gemv_with_a_tiles_pool(
+        &self,
+        out: &mut [f32],
+        act_i8: &[i8],
+        act_scale: f32,
+        a_tiles_i8: &mut [i8],
+        pool: &DecodeWorkerPool,
+    ) -> Result<(), K3Error> {
+        let needed_a = self.a_tiles_i8_len();
+        if out.len() > self.rows || act_i8.len() != self.cols || a_tiles_i8.len() < needed_a {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "RepackedTernaryMatrix::bitlinear_gemv".to_owned(),
+                offset: 0,
+                byte_len: out.len(),
+                buffer_len: self.rows,
+                reason: format!(
+                    "GEMV shape/scratch mismatch: out {} <= {}, act {} == {}, a_tiles {} >= {needed_a}",
+                    out.len(),
+                    self.rows,
+                    act_i8.len(),
+                    self.cols,
+                    a_tiles_i8.len()
+                ),
+            });
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+
+        let a_active = &mut a_tiles_i8[..needed_a];
+        prepare_a_tiles_slice(a_active, act_i8, self.blocks_per_row, self.block_k_chunks);
+        let a_ro: &[i8] = a_active;
+        pool.par_for_each_rows(out, TILE_N, |row_offset, chunk| {
+            self.eval_tile_range(chunk, row_offset, a_ro, act_scale);
+            Ok(())
+        })
+    }
+
+    fn eval_tile_range(
+        &self,
+        out_chunk: &mut [f32],
+        row_offset: usize,
+        a_i8: &[i8],
+        act_scale: f32,
+    ) {
+        debug_assert_eq!(row_offset % TILE_N, 0);
+        let first_nt = row_offset / TILE_N;
         let b_i8 = Aligned128::slice_as_i8(&self.tiles);
         let blk_stride = self.block_k_chunks * TILE_BYTES;
-        let active_n_tiles = out.len().div_ceil(TILE_N);
+        let local_n_tiles = out_chunk.len().div_ceil(TILE_N);
 
-        for nt in 0..active_n_tiles {
-            let r_base = nt * TILE_N;
-            let tile_rows = (out.len() - r_base).min(TILE_N);
+        for local_nt in 0..local_n_tiles {
+            let nt = first_nt + local_nt;
+            let local_base = local_nt * TILE_N;
+            let tile_rows = (out_chunk.len() - local_base).min(TILE_N);
             let mut row_sums = [0.0_f32; TILE_N];
 
             for blk in 0..self.blocks_per_row {
@@ -919,10 +1347,8 @@ impl RepackedTernaryMatrix {
                     }
                 }
             }
-            out[r_base..r_base + tile_rows].copy_from_slice(&row_sums[..tile_rows]);
+            out_chunk[local_base..local_base + tile_rows].copy_from_slice(&row_sums[..tile_rows]);
         }
-
-        Ok(())
     }
 
     /// Executes batched multi-token `BitLinear` matrix-matrix product `[M, K] x [N, K]^T -> [M, N]`
@@ -947,8 +1373,23 @@ impl RepackedTernaryMatrix {
 
     /// Executes per-32-element `Q8_0 x Q8_0` matrix-vector multiplication for non-kernel `Q8_0` LM heads.
     #[cfg(not(feature = "with-kernels"))]
-    fn gemv_q8_per32_blocks(&self, out: &mut [f32], hidden: &[f32]) -> Result<(), K3Error> {
-        if out.len() > self.rows || hidden.len() != self.cols || self.quant != QuantType::Q8_0 {
+    fn gemv_q8_per32_blocks_with_scratch_pool(
+        &self,
+        out: &mut [f32],
+        hidden: &[f32],
+        x_q: &mut [i8],
+        x_scales: &mut [f32],
+        a_tiles_i8: &mut [i8],
+        pool: &DecodeWorkerPool,
+    ) -> Result<(), K3Error> {
+        let needed_a = self.a_tiles_i8_len();
+        if out.len() > self.rows
+            || hidden.len() != self.cols
+            || self.quant != QuantType::Q8_0
+            || x_q.len() < self.cols
+            || x_scales.len() < self.blocks_per_row
+            || a_tiles_i8.len() < needed_a
+        {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: "RepackedTernaryMatrix::gemv_q8_per32_blocks".to_owned(),
                 offset: 0,
@@ -957,44 +1398,61 @@ impl RepackedTernaryMatrix {
                 reason: "Q8_0 LM head projection dimension mismatch".to_owned(),
             });
         }
-        let mut x_q = vec![0_i8; self.cols];
-        let mut x_scales = vec![0.0_f32; self.blocks_per_row];
+        if out.is_empty() {
+            return Ok(());
+        }
+
+        let x_q_active = &mut x_q[..self.cols];
+        let x_scales_active = &mut x_scales[..self.blocks_per_row];
         for blk in 0..self.blocks_per_row {
             let sub = &hidden[blk * 32..(blk + 1) * 32];
-            x_scales[blk] = quantize_q8_block32(sub, &mut x_q[blk * 32..(blk + 1) * 32]);
+            x_scales_active[blk] =
+                quantize_q8_block32(sub, &mut x_q_active[blk * 32..(blk + 1) * 32]);
         }
-        let mut scratch = BitLinearActScratch::with_max_cols(self.cols);
-        scratch.prepare_block_tiles(&x_q, self.blocks_per_row, self.block_k_chunks);
+        let a_active = &mut a_tiles_i8[..needed_a];
+        prepare_a_tiles_slice(
+            a_active,
+            x_q_active,
+            self.blocks_per_row,
+            self.block_k_chunks,
+        );
 
-        let a_i8 = Aligned128::slice_as_i8(&scratch.a_tiles);
+        let a_i8: &[i8] = a_active;
+        let x_scales_ro: &[f32] = x_scales_active;
         let b_i8 = Aligned128::slice_as_i8(&self.tiles);
         let blk_stride = self.block_k_chunks * TILE_BYTES;
-        let active_n_tiles = out.len().div_ceil(TILE_N);
 
-        for nt in 0..active_n_tiles {
-            let r_base = nt * TILE_N;
-            let tile_rows = (out.len() - r_base).min(TILE_N);
-            let mut row_sums = [0.0_f32; TILE_N];
-            for blk in 0..self.blocks_per_row {
-                let a_blk = &a_i8[blk * blk_stride..(blk + 1) * blk_stride];
-                let b_idx = (nt * self.blocks_per_row + blk) * blk_stride;
-                let b_blk = &b_i8[b_idx..b_idx + blk_stride];
-                let dot_c = compute_tile_row0_dots(a_blk, b_blk, self.block_k_chunks);
-                let scale_base = (nt * self.blocks_per_row + blk) * TILE_N;
-                for j in 0..tile_rows {
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        reason = "32-element int32 block sum fits in f32 mantissa"
-                    )]
-                    {
-                        row_sums[j] +=
-                            (dot_c[j] as f32) * self.block_scales[scale_base + j] * x_scales[blk];
+        pool.par_for_each_rows(out, TILE_N, |row_offset, out_chunk| {
+            let first_nt = row_offset / TILE_N;
+            let local_n_tiles = out_chunk.len().div_ceil(TILE_N);
+            for local_nt in 0..local_n_tiles {
+                let nt = first_nt + local_nt;
+                let local_base = local_nt * TILE_N;
+                let tile_rows = (out_chunk.len() - local_base).min(TILE_N);
+                let mut row_sums = [0.0_f32; TILE_N];
+                for blk in 0..self.blocks_per_row {
+                    let a_blk = &a_i8[blk * blk_stride..(blk + 1) * blk_stride];
+                    let b_idx = (nt * self.blocks_per_row + blk) * blk_stride;
+                    let b_blk = &b_i8[b_idx..b_idx + blk_stride];
+                    let dot_c = compute_tile_row0_dots(a_blk, b_blk, self.block_k_chunks);
+                    let scale_base = (nt * self.blocks_per_row + blk) * TILE_N;
+                    for j in 0..tile_rows {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "32-element int32 block sum fits in f32 mantissa"
+                        )]
+                        {
+                            row_sums[j] += (dot_c[j] as f32)
+                                * self.block_scales[scale_base + j]
+                                * x_scales_ro[blk];
+                        }
                     }
                 }
+                out_chunk[local_base..local_base + tile_rows]
+                    .copy_from_slice(&row_sums[..tile_rows]);
             }
-            out[r_base..r_base + tile_rows].copy_from_slice(&row_sums[..tile_rows]);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1029,34 +1487,164 @@ fn quantize_q8_block32(src: &[f32], dst: &mut [i8]) -> f32 {
     scale
 }
 
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass 1x8 RVV 1.0 asm kernel reusing v8 across 8 weight rows with explicit vector clobbers"
+)]
+#[inline]
+fn compute_tile_row0_dots_rvv(a_blk: &[i8], b_blk: &[i8], k_chunks: usize) -> [i32; TILE_N] {
+    let mut out = [0_i32; TILE_N];
+    if k_chunks == 0 {
+        return out;
+    }
+    assert!(a_blk.len() >= k_chunks * TILE_BYTES);
+    assert!(b_blk.len() >= k_chunks * TILE_BYTES);
+    let pa = a_blk.as_ptr();
+    let pb = b_blk.as_ptr();
+    let rem_chunks = k_chunks;
+    let out_ptr = out.as_mut_ptr();
+    // SAFETY: Caller asserted `a_blk` and `b_blk` hold at least `k_chunks * 128` readable `i8`
+    // bytes and `out` has `TILE_N = 8` writable `i32` slots. Uses baseline RVV 1.0 (`+v`, valid on
+    // any `VLEN >= 128`): `vsetivli zero, 16, e8, m1` loads 16-byte rows into non-overlapping `m1`
+    // registers, `vwmul.vv` widens into even `e16, m2` pairs `v10..v17`, and `vwredsum.vs`
+    // reduces exact `i32` sums into scalar element 0 of `v24..v31` (`e32, m1`).
+    unsafe {
+        core::arch::asm!(
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vmv.v.i v24, 0",
+            "vmv.v.i v25, 0",
+            "vmv.v.i v26, 0",
+            "vmv.v.i v27, 0",
+            "vmv.v.i v28, 0",
+            "vmv.v.i v29, 0",
+            "vmv.v.i v30, 0",
+            "vmv.v.i v31, 0",
+            "2:",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vle8.v v8, ({pa})",
+            "addi t0, {pb}, 16",
+            "addi t1, {pb}, 32",
+            "addi t2, {pb}, 48",
+            "vle8.v v1, ({pb})",
+            "vle8.v v2, (t0)",
+            "vle8.v v3, (t1)",
+            "vle8.v v4, (t2)",
+            "vwmul.vv v10, v8, v1",
+            "vwmul.vv v12, v8, v2",
+            "vwmul.vv v14, v8, v3",
+            "vwmul.vv v16, v8, v4",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v24, v10, v24",
+            "vwredsum.vs v25, v12, v25",
+            "vwredsum.vs v26, v14, v26",
+            "vwredsum.vs v27, v16, v27",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "addi t0, {pb}, 64",
+            "addi t1, {pb}, 80",
+            "addi t2, {pb}, 96",
+            "addi t3, {pb}, 112",
+            "vle8.v v1, (t0)",
+            "vle8.v v2, (t1)",
+            "vle8.v v3, (t2)",
+            "vle8.v v4, (t3)",
+            "vwmul.vv v10, v8, v1",
+            "vwmul.vv v12, v8, v2",
+            "vwmul.vv v14, v8, v3",
+            "vwmul.vv v16, v8, v4",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v28, v10, v28",
+            "vwredsum.vs v29, v12, v29",
+            "vwredsum.vs v30, v14, v30",
+            "vwredsum.vs v31, v16, v31",
+            "addi {pa}, {pa}, 128",
+            "addi {pb}, {pb}, 128",
+            "addi {rem}, {rem}, -1",
+            "bnez {rem}, 2b",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vmv.x.s t0, v24",
+            "sw t0, 0({pout})",
+            "vmv.x.s t0, v25",
+            "sw t0, 4({pout})",
+            "vmv.x.s t0, v26",
+            "sw t0, 8({pout})",
+            "vmv.x.s t0, v27",
+            "sw t0, 12({pout})",
+            "vmv.x.s t0, v28",
+            "sw t0, 16({pout})",
+            "vmv.x.s t0, v29",
+            "sw t0, 20({pout})",
+            "vmv.x.s t0, v30",
+            "sw t0, 24({pout})",
+            "vmv.x.s t0, v31",
+            "sw t0, 28({pout})",
+            pa = inout(reg) pa => _,
+            pb = inout(reg) pb => _,
+            rem = inout(reg) rem_chunks => _,
+            pout = in(reg) out_ptr,
+            out("t0") _,
+            out("t1") _,
+            out("t2") _,
+            out("t3") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v8") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v24") _,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack),
+        );
+    }
+    out
+}
+
+#[cfg(any(not(target_arch = "riscv64"), miri, test))]
+#[inline]
+pub(crate) fn compute_tile_row0_dots_scalar(
+    a_blk: &[i8],
+    b_blk: &[i8],
+    k_chunks: usize,
+) -> [i32; TILE_N] {
+    let mut out = [0_i32; TILE_N];
+    for ch in 0..k_chunks {
+        let a_row = &a_blk[ch * TILE_BYTES..ch * TILE_BYTES + TILE_K];
+        let b_base = ch * TILE_BYTES;
+        for j in 0..TILE_N {
+            let b_row = &b_blk[b_base + j * TILE_K..b_base + (j + 1) * TILE_K];
+            let mut acc = 0_i32;
+            for k in 0..TILE_K {
+                acc += i32::from(a_row[k]) * i32::from(b_row[k]);
+            }
+            out[j] += acc;
+        }
+    }
+    out
+}
+
 #[inline]
 fn compute_tile_row0_dots(a_blk: &[i8], b_blk: &[i8], k_chunks: usize) -> [i32; TILE_N] {
-    #[cfg(feature = "with-kernels")]
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
     {
-        let mut dot_c = [0_i32; TILE_C];
-        gemm_i8_ime(a_blk, 1, b_blk, 0..1, k_chunks, |_, _, tile| {
-            dot_c = *tile;
-        });
-        let mut out = [0_i32; TILE_N];
-        out.copy_from_slice(&dot_c[..TILE_N]);
-        out
+        compute_tile_row0_dots_rvv(a_blk, b_blk, k_chunks)
     }
-    #[cfg(not(feature = "with-kernels"))]
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
     {
-        let mut out = [0_i32; TILE_N];
-        for ch in 0..k_chunks {
-            let a_row = &a_blk[ch * TILE_BYTES..ch * TILE_BYTES + TILE_K];
-            let b_base = ch * TILE_BYTES;
-            for j in 0..TILE_N {
-                let b_row = &b_blk[b_base + j * TILE_K..b_base + (j + 1) * TILE_K];
-                let mut acc = 0_i32;
-                for k in 0..TILE_K {
-                    acc += i32::from(a_row[k]) * i32::from(b_row[k]);
-                }
-                out[j] += acc;
-            }
-        }
-        out
+        compute_tile_row0_dots_scalar(a_blk, b_blk, k_chunks)
     }
 }
 
@@ -1521,6 +2109,43 @@ impl CompactLmHeadMatrix {
         if logits.is_empty() {
             return Ok(());
         }
+        let need_bytes = {
+            let base = self
+                .cols()
+                .saturating_mul(4)
+                .saturating_add(self.cols().div_ceil(32).saturating_mul(2 * 128 + 32))
+                .max(1024);
+            #[cfg(feature = "with-kernels")]
+            {
+                base.max(QuantizedActQ8View::scratch_bytes_for_row(self.cols()))
+            }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                base
+            }
+        };
+        let mut ws = ScratchWorkspace::new(need_bytes)?;
+        let scope = ws.scope();
+        let pool = DecodeWorkerPool::single();
+        self.project_logits_with_pool_and_scope(logits, hidden, &pool, &scope)
+    }
+
+    /// Projects `hidden` directly from compact storage into `logits` across `pool` partitions
+    /// using caller-provided `scope` scratch (zero heap allocations for portable & ternary paths).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch or scratch capacity is too small.
+    pub fn project_logits_with_pool_and_scope(
+        &self,
+        logits: &mut [f32],
+        hidden: &[f32],
+        pool: &DecodeWorkerPool,
+        scope: &ScratchScope<'_>,
+    ) -> Result<(), K3Error> {
+        if logits.is_empty() {
+            return Ok(());
+        }
         if logits.len() > self.rows() || hidden.len() != self.cols() {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: "CompactLmHeadMatrix::project_logits".to_owned(),
@@ -1539,8 +2164,10 @@ impl CompactLmHeadMatrix {
         match self {
             #[cfg(feature = "with-kernels")]
             Self::Repacked(w) => {
-                let act = QuantizedActQ8::quantize_row(hidden)?;
-                w.gemv_rows(logits, &act, 0..logits.len())
+                let act_view = QuantizedActQ8View::quantize_row_in_scope(hidden, scope)?;
+                pool.par_for_each_rows(logits, TILE_N, |row_off, chunk| {
+                    w.gemv_view_rows(chunk, &act_view, row_off..row_off + chunk.len())
+                })
             }
             #[cfg(not(feature = "with-kernels"))]
             Self::DenseHalf {
@@ -1549,8 +2176,9 @@ impl CompactLmHeadMatrix {
                 blocks_per_row,
                 data,
                 ..
-            } => {
-                for (r, slot) in logits.iter_mut().enumerate() {
+            } => pool.par_for_each_rows(logits, TILE_N, |row_off, chunk| {
+                for (local_r, slot) in chunk.iter_mut().enumerate() {
+                    let r = row_off + local_r;
                     let row_u16 = Aligned128::slice_as_u16(
                         &data[r * blocks_per_row..(r + 1) * blocks_per_row],
                     );
@@ -1566,17 +2194,25 @@ impl CompactLmHeadMatrix {
                     *slot = sum;
                 }
                 Ok(())
-            }
+            }),
             #[cfg(not(feature = "with-kernels"))]
-            Self::BlockQ8(m) => m.gemv_q8_per32_blocks(logits, hidden),
+            Self::BlockQ8(m) => {
+                let x_q = scope.alloc_i8(self.cols())?;
+                let x_scales = scope.alloc_f32(m.blocks_per_row())?;
+                let a_tiles = scope.alloc_i8(m.a_tiles_i8_len())?;
+                m.gemv_q8_per32_blocks_with_scratch_pool(
+                    logits, hidden, x_q, x_scales, a_tiles, pool,
+                )
+            }
             #[cfg(not(feature = "with-kernels"))]
             Self::DenseF32 {
                 cols,
                 blocks_per_row,
                 data,
                 ..
-            } => {
-                for (r, slot) in logits.iter_mut().enumerate() {
+            } => pool.par_for_each_rows(logits, TILE_N, |row_off, chunk| {
+                for (local_r, slot) in chunk.iter_mut().enumerate() {
+                    let r = row_off + local_r;
                     let row_f32 = Aligned128::slice_as_f32(
                         &data[r * blocks_per_row..(r + 1) * blocks_per_row],
                     );
@@ -1587,11 +2223,12 @@ impl CompactLmHeadMatrix {
                         .sum();
                 }
                 Ok(())
-            }
+            }),
             Self::Ternary(m) => {
-                let mut act_i8 = vec![0_i8; hidden.len()];
-                let scale = BitNetRecipe::quantize_absmax_i8(&mut act_i8, hidden)?;
-                m.bitlinear_gemv(logits, &act_i8, scale)
+                let act_i8 = scope.alloc_i8(self.cols())?;
+                let scale = BitNetRecipe::quantize_absmax_i8(act_i8, hidden)?;
+                let a_tiles = scope.alloc_i8(m.a_tiles_i8_len())?;
+                m.bitlinear_gemv_with_a_tiles_pool(logits, act_i8, scale, a_tiles, pool)
             }
         }
     }
@@ -1620,11 +2257,14 @@ struct CachedLmHead {
 /// pre-decoded `SubLN` norm vectors, and compact tied/untied `token_embd` / LM-head storage.
 pub struct BitNetModelCache {
     anchor: Option<TensorIdentity>,
+    output_weight_present: Option<(TensorIdentity, usize, usize, bool)>,
     norms: HashMap<String, CachedNorm>,
     projections: HashMap<String, CachedProjection>,
     token_embd: Option<CachedLmHead>,
     lm_head: Option<CachedLmHead>,
     act_scratch: BitLinearActScratch,
+    worker_pool: DecodeWorkerPool,
+    explicit_workers: bool,
     populate_on_miss: bool,
     max_cache_bytes: usize,
     stats: BitNetCacheStats,
@@ -1640,11 +2280,14 @@ impl core::fmt::Debug for BitNetModelCache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BitNetModelCache")
             .field("anchor", &self.anchor)
+            .field("output_weight_present", &self.output_weight_present)
             .field("cached_norms", &self.norms.len())
             .field("cached_projections", &self.projections.len())
             .field("has_token_embd", &self.token_embd.is_some())
             .field("has_lm_head", &self.lm_head.is_some())
             .field("act_scratch", &self.act_scratch)
+            .field("decode_workers", &self.worker_pool.worker_count())
+            .field("explicit_workers", &self.explicit_workers)
             .field("populate_on_miss", &self.populate_on_miss)
             .field("max_cache_bytes", &self.max_cache_bytes)
             .field("stats", &self.stats)
@@ -1664,15 +2307,40 @@ impl BitNetModelCache {
     pub fn with_max_bytes(max_cache_bytes: usize) -> Self {
         Self {
             anchor: None,
+            output_weight_present: None,
             norms: HashMap::new(),
             projections: HashMap::new(),
             token_embd: None,
             lm_head: None,
             act_scratch: BitLinearActScratch::new(),
+            worker_pool: DecodeWorkerPool::new(default_decode_workers()),
+            explicit_workers: false,
             populate_on_miss: true,
             max_cache_bytes,
             stats: BitNetCacheStats::default(),
         }
+    }
+
+    /// Configures the number of worker partitions (`1..=64`) used for row-parallel GEMV.
+    #[must_use]
+    pub fn with_decode_workers(mut self, workers: usize) -> Self {
+        self.set_decode_workers(workers);
+        self
+    }
+
+    /// Updates the row-parallel decode worker count (`1..=64`), spawning helper threads up front.
+    pub fn set_decode_workers(&mut self, workers: usize) {
+        let clamped = workers.clamp(1, 64);
+        self.explicit_workers = true;
+        if self.worker_pool.worker_count() != clamped {
+            self.worker_pool = DecodeWorkerPool::new(clamped);
+        }
+    }
+
+    /// Returns the active decode worker partition count (`>= 1`).
+    #[must_use]
+    pub const fn decode_workers(&self) -> usize {
+        self.worker_pool.worker_count()
     }
 
     /// Global singleton default: read-only lookup on un-preloaded models so cold `decode_step`
@@ -1680,8 +2348,18 @@ impl BitNetModelCache {
     #[must_use]
     fn new_deferred() -> Self {
         Self {
+            anchor: None,
+            output_weight_present: None,
+            norms: HashMap::new(),
+            projections: HashMap::new(),
+            token_embd: None,
+            lm_head: None,
+            act_scratch: BitLinearActScratch::new(),
+            worker_pool: DecodeWorkerPool::single(),
+            explicit_workers: false,
             populate_on_miss: false,
-            ..Self::new()
+            max_cache_bytes: DEFAULT_MAX_REPACK_CACHE_BYTES,
+            stats: BitNetCacheStats::default(),
         }
     }
 
@@ -1749,6 +2427,7 @@ impl BitNetModelCache {
     /// Clears cached norms, projections, and embeddings without resetting cumulative stats.
     pub fn invalidate_entries(&mut self) {
         self.anchor = None;
+        self.output_weight_present = None;
         self.norms.clear();
         self.projections.clear();
         self.token_embd = None;
@@ -1811,6 +2490,12 @@ impl BitNetModelCache {
             return Ok(());
         }
         self.ensure_model_anchor(weights)?;
+        if !self.explicit_workers && self.worker_pool.worker_count() <= 1 {
+            let target = default_decode_workers();
+            if target > 1 {
+                self.worker_pool = DecodeWorkerPool::new(target);
+            }
+        }
 
         let hidden_dim = recipe.hidden_dim.max(16);
         let ffn_dim = recipe.ffn_dim.max(16);
@@ -1829,7 +2514,16 @@ impl BitNetModelCache {
             let _ =
                 self.get_or_load_table("token_embd.weight", &embd, total_rows, hidden_dim, true)?;
         }
-        if weights.contains_tensor("output.weight") {
+        let has_output_weight = weights.contains_tensor("output.weight");
+        if let Some(anchor) = self.anchor {
+            self.output_weight_present = Some((
+                anchor,
+                weights.tensor_count(),
+                weights.total_weight_bytes(),
+                has_output_weight,
+            ));
+        }
+        if has_output_weight {
             let out_w = weights.tensor("output.weight")?;
             let total_rows = BitNetRecipe::matrix_row_col_dims(&out_w, hidden_dim, 1)?;
             let _ =
@@ -2010,13 +2704,26 @@ impl BitNetModelCache {
         act_i8: &[i8],
         act_scale: f32,
     ) -> Result<(), K3Error> {
+        self.act_scratch.ensure_max_cols(act_i8.len());
+        let a_len = self.act_scratch.a_tiles.len().saturating_mul(TILE_BYTES);
         let view = weights.tensor(name)?;
         if is_block_repack_quant(view.quant()) {
+            let block_elems =
+                BitNetRecipe::quant_block_layout(view.quant()).map_or(256, |(e, _, _)| e);
+            let blocks_per_row = act_i8.len().div_ceil(block_elems);
+            let block_k_chunks = block_elems.div_ceil(TILE_K);
+            let needed = blocks_per_row * block_k_chunks;
+            if a_len < needed * TILE_BYTES {
+                self.act_scratch
+                    .a_tiles
+                    .resize(needed, Aligned128::zeroed());
+            }
             if !self.populate_on_miss {
                 let identity = TensorIdentity::from_view(&view);
                 let Self {
                     projections,
                     act_scratch,
+                    worker_pool,
                     stats,
                     ..
                 } = self;
@@ -2026,11 +2733,13 @@ impl BitNetModelCache {
                     && entry.matrix.cols() == act_i8.len()
                 {
                     stats.weight_hits += 1;
-                    return entry.matrix.bitlinear_gemv_with_scratch(
+                    let a_tiles_i8 = Aligned128::slice_as_i8_mut(&mut act_scratch.a_tiles);
+                    return entry.matrix.bitlinear_gemv_with_a_tiles_pool(
                         out,
                         act_i8,
                         act_scale,
-                        act_scratch,
+                        a_tiles_i8,
+                        worker_pool,
                     );
                 }
                 return BitNetRecipe::dispatch_bitlinear(out, &view, act_i8, act_scale);
@@ -2038,11 +2747,70 @@ impl BitNetModelCache {
             if let Some(cached) =
                 self.get_or_repack_projection(name, &view, out.len(), act_i8.len())?
             {
-                return cached.bitlinear_gemv_with_scratch(
+                let a_tiles_i8 = Aligned128::slice_as_i8_mut(&mut self.act_scratch.a_tiles);
+                return cached.bitlinear_gemv_with_a_tiles_pool(
                     out,
                     act_i8,
                     act_scale,
-                    &mut self.act_scratch,
+                    a_tiles_i8,
+                    &self.worker_pool,
+                );
+            }
+        }
+        BitNetRecipe::dispatch_bitlinear(out, &view, act_i8, act_scale)
+    }
+
+    /// Executes a cached `BitLinear` projection using a caller-owned `128-byte`-aligned activation
+    /// tile buffer from `ScratchWorkspace`, avoiding heap allocations or cache scratch mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if weights are malformed, shapes mismatch, or
+    /// `a_tiles_i8` is smaller than required.
+    pub fn dispatch_projection_with_a_tiles(
+        &mut self,
+        weights: &dyn ModelWeights,
+        name: &str,
+        out: &mut [f32],
+        act_i8: &[i8],
+        act_scale: f32,
+        a_tiles_i8: &mut [i8],
+    ) -> Result<(), K3Error> {
+        let view = weights.tensor(name)?;
+        if is_block_repack_quant(view.quant()) {
+            if !self.populate_on_miss {
+                let identity = TensorIdentity::from_view(&view);
+                let Self {
+                    projections,
+                    worker_pool,
+                    stats,
+                    ..
+                } = self;
+                if let Some(entry) = projections.get(name)
+                    && entry.identity == identity
+                    && entry.matrix.rows() == out.len()
+                    && entry.matrix.cols() == act_i8.len()
+                {
+                    stats.weight_hits += 1;
+                    return entry.matrix.bitlinear_gemv_with_a_tiles_pool(
+                        out,
+                        act_i8,
+                        act_scale,
+                        a_tiles_i8,
+                        worker_pool,
+                    );
+                }
+                return BitNetRecipe::dispatch_bitlinear(out, &view, act_i8, act_scale);
+            }
+            if let Some(cached) =
+                self.get_or_repack_projection(name, &view, out.len(), act_i8.len())?
+            {
+                return cached.bitlinear_gemv_with_a_tiles_pool(
+                    out,
+                    act_i8,
+                    act_scale,
+                    a_tiles_i8,
+                    &self.worker_pool,
                 );
             }
         }
@@ -2230,24 +2998,82 @@ impl BitNetModelCache {
         if logits.is_empty() {
             return Ok(());
         }
+        let need_bytes = {
+            let base = hidden
+                .len()
+                .saturating_mul(4)
+                .saturating_add(hidden.len().div_ceil(32).saturating_mul(2 * 128 + 32))
+                .max(1024);
+            #[cfg(feature = "with-kernels")]
+            {
+                base.max(QuantizedActQ8View::scratch_bytes_for_row(hidden.len()))
+            }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                base
+            }
+        };
+        let mut ws = ScratchWorkspace::new(need_bytes)?;
+        let scope = ws.scope();
+        self.project_lm_head_with_scope(weights, recipe, logits, hidden, token_seed, &scope)
+    }
+
+    /// Projects logits from `hidden` via compact cached LM-head storage using caller-owned `scope`
+    /// scratch and the cache's configured [`DecodeWorkerPool`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on invalid shapes, scratch exhaustion, or missing LM-head weights.
+    pub fn project_lm_head_with_scope(
+        &mut self,
+        weights: &dyn ModelWeights,
+        recipe: &BitNetRecipe,
+        logits: &mut [f32],
+        hidden: &[f32],
+        token_seed: Option<u32>,
+        scope: &ScratchScope<'_>,
+    ) -> Result<(), K3Error> {
+        if logits.is_empty() {
+            return Ok(());
+        }
         if weights.tensor_count() == 0 {
-            return recipe.project_lm_head(logits, hidden, token_seed, weights);
+            return recipe.project_lm_head_with_scope(
+                logits,
+                hidden,
+                token_seed,
+                weights,
+                Some(&self.worker_pool),
+                scope,
+            );
         }
 
-        let (key, head_weight) = if weights.contains_tensor("output.weight") {
-            ("output.weight", weights.tensor("output.weight")?)
-        } else if weights.contains_tensor("token_embd.weight") {
-            ("token_embd.weight", weights.tensor("token_embd.weight")?)
-        } else {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "output.weight".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "neither 'output.weight' nor tied 'token_embd.weight' found in weights"
-                    .to_owned(),
-            });
-        };
+        let tc = weights.tensor_count();
+        let twb = weights.total_weight_bytes();
+        let cached_output_absent = matches!(
+            (self.anchor, self.output_weight_present),
+            (Some(a), Some((oa, otc, otwb, false))) if a == oa && otc == tc && otwb == twb
+        );
+        let (key, head_weight) =
+            if !cached_output_absent && weights.contains_tensor("output.weight") {
+                if let Some(anchor) = self.anchor {
+                    self.output_weight_present = Some((anchor, tc, twb, true));
+                }
+                ("output.weight", weights.tensor("output.weight")?)
+            } else if weights.contains_tensor("token_embd.weight") {
+                if !cached_output_absent && let Some(anchor) = self.anchor {
+                    self.output_weight_present = Some((anchor, tc, twb, false));
+                }
+                ("token_embd.weight", weights.tensor("token_embd.weight")?)
+            } else {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "output.weight".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "neither 'output.weight' nor tied 'token_embd.weight' found in weights"
+                        .to_owned(),
+                });
+            };
 
         if !self.populate_on_miss {
             let total_rows =
@@ -2262,17 +3088,41 @@ impl BitNetModelCache {
             ) {
                 let cached = Arc::clone(compact);
                 self.stats.lm_head_hits += 1;
-                return cached.project_logits(logits, hidden);
+                return cached.project_logits_with_pool_and_scope(
+                    logits,
+                    hidden,
+                    &self.worker_pool,
+                    scope,
+                );
             }
-            return recipe.project_lm_head(logits, hidden, token_seed, weights);
+            return recipe.project_lm_head_with_scope(
+                logits,
+                hidden,
+                token_seed,
+                weights,
+                Some(&self.worker_pool),
+                scope,
+            );
         }
 
         if let Some(compact) =
             self.get_or_load_compact_for_head(key, &head_weight, logits.len(), hidden.len())?
         {
-            return compact.project_logits(logits, hidden);
+            return compact.project_logits_with_pool_and_scope(
+                logits,
+                hidden,
+                &self.worker_pool,
+                scope,
+            );
         }
-        recipe.project_lm_head(logits, hidden, token_seed, weights)
+        recipe.project_lm_head_with_scope(
+            logits,
+            hidden,
+            token_seed,
+            weights,
+            Some(&self.worker_pool),
+            scope,
+        )
     }
 
     fn get_or_load_compact_for_head(
@@ -2349,16 +3199,17 @@ impl BitNetRecipe {
         }
     }
 
-    pub(crate) fn dispatch_proj_opt(
+    pub(crate) fn dispatch_proj_with_a_tiles_opt(
         cache: Option<&mut BitNetModelCache>,
         weights: &dyn ModelWeights,
         name: &str,
         out: &mut [f32],
         act_i8: &[i8],
         act_scale: f32,
+        a_tiles_i8: &mut [i8],
     ) -> Result<(), K3Error> {
         if let Some(c) = cache {
-            c.dispatch_projection(weights, name, out, act_i8, act_scale)
+            c.dispatch_projection_with_a_tiles(weights, name, out, act_i8, act_scale, a_tiles_i8)
         } else {
             let view = weights.tensor(name)?;
             Self::dispatch_bitlinear(out, &view, act_i8, act_scale)
@@ -2455,13 +3306,62 @@ impl BitNetRecipe {
         }
         let pos = ctx.position();
         let seq_len = pos + 1;
-        let hidden =
-            self.run_tokens_with_cache(&[token], pos, seq_len, ctx, weights, cache.as_deref_mut())?;
-        ctx.advance_position(1)?;
-        match cache {
-            Some(c) => c.project_lm_head(weights, self, ctx.logits_mut(), &hidden, Some(token)),
-            None => self.project_lm_head(ctx.logits_mut(), &hidden, Some(token), weights),
+        let has_valid_kv_view = ctx.kv_view_mut().is_some();
+        let mut fallback_ws: ScratchWorkspace;
+        {
+            let (logits, mut kv_storage, scratch_opt) = if has_valid_kv_view {
+                let (logits, kv_view, scratch_opt) = ctx.logits_kv_and_scratch_mut();
+                (
+                    logits,
+                    crate::recipe::KvStorage::View(
+                        kv_view.expect("verified KvCacheView for decode step"),
+                    ),
+                    scratch_opt,
+                )
+            } else {
+                let (logits, kv_raw, scratch_opt) = ctx.buffers_and_scratch_mut();
+                (logits, crate::recipe::KvStorage::Raw(kv_raw), scratch_opt)
+            };
+            let active_ws = if let Some(ws) = scratch_opt {
+                ws
+            } else {
+                fallback_ws = ScratchWorkspace::new(self.decode_scratch_bytes(seq_len))?;
+                &mut fallback_ws
+            };
+            let mut ckpt = active_ws.checkpoint();
+            let scope = ckpt.workspace().scope();
+            let hidden = scope.alloc_f32_zeroed(self.hidden_dim.max(16))?;
+            self.execute_token_step_with_scratch(
+                token,
+                pos,
+                seq_len,
+                &mut kv_storage,
+                weights,
+                cache.as_deref_mut(),
+                hidden,
+                &scope,
+            )?;
+            match cache {
+                Some(c) => c.project_lm_head_with_scope(
+                    weights,
+                    self,
+                    logits,
+                    hidden,
+                    Some(token),
+                    &scope,
+                )?,
+                None => self.project_lm_head_with_scope(
+                    logits,
+                    hidden,
+                    Some(token),
+                    weights,
+                    None,
+                    &scope,
+                )?,
+            }
         }
+        ctx.advance_position(1)?;
+        Ok(())
     }
 }
 
@@ -3026,5 +3926,103 @@ mod tests {
             BitNetVocabContract::from_gguf(&bad, 16).is_err(),
             "EOS OOB must fail closed"
         );
+    }
+
+    #[test]
+    fn test_wave4_compute_tile_dots_parity_and_worker_pool_determinism() {
+        if cfg!(miri) {
+            assert_eq!(default_decode_workers(), 1);
+        } else {
+            assert!((1..=8).contains(&default_decode_workers()));
+        }
+
+        let k_chunks = 2;
+        let mut a_blk = [0_i8; 2 * TILE_BYTES];
+        let mut b_blk = [0_i8; 2 * TILE_BYTES];
+        for ch in 0..k_chunks {
+            for k in 0..TILE_K {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "bounded small i8 test values in [-10, 10]"
+                )]
+                {
+                    a_blk[ch * TILE_BYTES + k] = ((ch * 7 + k) % 11) as i8 - 5;
+                    for j in 0..TILE_N {
+                        b_blk[ch * TILE_BYTES + j * TILE_K + k] =
+                            (((ch + 1) * (j + 3) + k) % 3) as i8 - 1;
+                    }
+                }
+            }
+        }
+        let scalar = compute_tile_row0_dots_scalar(&a_blk, &b_blk, k_chunks);
+        let active = compute_tile_row0_dots(&a_blk, &b_blk, k_chunks);
+        assert_eq!(active, scalar);
+
+        let single = DecodeWorkerPool::single();
+        assert_eq!(single.worker_count(), 1);
+        let parallel = DecodeWorkerPool::new(if cfg!(miri) { 2 } else { 4 });
+
+        for len in [0_usize, 1, 7, 8, 9, 17, 33] {
+            let mut ref_out = vec![0.0_f32; len];
+            let mut par_out = vec![0.0_f32; len];
+            single
+                .par_for_each_rows(&mut ref_out, TILE_N, |row_off, chunk| {
+                    for (local, slot) in chunk.iter_mut().enumerate() {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "tiny exact integer test indices <= 33"
+                        )]
+                        {
+                            *slot = ((row_off + local) * 3 + 1) as f32 * 0.25;
+                        }
+                    }
+                    Ok(())
+                })
+                .expect("single pool ok");
+            parallel
+                .par_for_each_rows(&mut par_out, TILE_N, |row_off, chunk| {
+                    for (local, slot) in chunk.iter_mut().enumerate() {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "tiny exact integer test indices <= 33"
+                        )]
+                        {
+                            *slot = ((row_off + local) * 3 + 1) as f32 * 0.25;
+                        }
+                    }
+                    Ok(())
+                })
+                .expect("parallel pool ok");
+            for (r, p) in ref_out.iter().zip(&par_out) {
+                assert_eq!(r.to_bits(), p.to_bits());
+            }
+        }
+
+        let mut err_buf = [0.0_f32; 24];
+        let err = parallel.par_for_each_rows(&mut err_buf, TILE_N, |row_off, _| {
+            if row_off >= 8 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "bitnet".to_owned(),
+                    reason: "intentional worker partition error".to_owned(),
+                });
+            }
+            Ok(())
+        });
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_wave4_cache_worker_count_clamping_and_debug() {
+        let mut cache = BitNetModelCache::new().with_decode_workers(if cfg!(miri) { 1 } else { 4 });
+        assert_eq!(cache.decode_workers(), if cfg!(miri) { 1 } else { 4 });
+        if !cfg!(miri) {
+            cache.set_decode_workers(128);
+            assert_eq!(cache.decode_workers(), 64);
+            cache.set_decode_workers(1);
+            assert_eq!(cache.decode_workers(), 1);
+        }
+        let dbg = format!("{cache:?}");
+        assert!(dbg.contains("decode_workers"));
+        assert!(dbg.contains("explicit_workers"));
     }
 }

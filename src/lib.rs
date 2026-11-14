@@ -15,8 +15,8 @@ pub use recipe::BitNetRecipe;
 pub use repack_cache::{
     Aligned128, BitLinearActScratch, BitNetCacheStats, BitNetModelCache, BitNetVocabContract,
     CompactLmHeadMatrix, DEFAULT_DENSE_F32_MAX_ELEMENTS, DEFAULT_MAX_REPACK_CACHE_BYTES,
-    LLAMA3_BITNET_VOCAB_SIZE, LLAMA3_END_OF_TEXT_TOKEN_ID, LLAMA3_EOT_TOKEN_ID,
-    RepackedTernaryMatrix, TensorIdentity, WEIGHT_TILE_ALIGNMENT_BYTES,
+    DecodeWorkerPool, LLAMA3_BITNET_VOCAB_SIZE, LLAMA3_END_OF_TEXT_TOKEN_ID, LLAMA3_EOT_TOKEN_ID,
+    RepackedTernaryMatrix, TensorIdentity, WEIGHT_TILE_ALIGNMENT_BYTES, default_decode_workers,
 };
 
 #[cfg(test)]
