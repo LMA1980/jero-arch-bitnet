@@ -1042,12 +1042,13 @@ fn test_empirical_subln_weight_sensitivity_across_7_projections() {
         "Distinct SubLN mutations must produce distinct logits"
     );
 
-    // Mutate ffn_norm with channel-dependent gradient (affects ffn_gate, ffn_up)
+    // Mutate ffn_norm with channel-dependent sign/magnitude gradient (affects ffn_gate, ffn_up)
     let mut w_ffn_sub =
         build_synthetic_single_layer_weights(hidden_dim, ffn_dim, total_q, total_kv, 1.0, 1.0);
     let mut ffn_sub_raw = vec![0u8; hidden_dim * 4];
     for i in 0..hidden_dim {
-        let val = 1.0 + (i as f32) * 0.04;
+        let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
+        let val = sign * (1.0 + (i as f32) * 0.04);
         ffn_sub_raw[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
     }
     w_ffn_sub.insert_tensor(
