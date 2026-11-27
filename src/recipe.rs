@@ -13,10 +13,10 @@ use std::fmt::Write as _;
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    QuantizedActQ8View, RopeType, apply_rope_inplace, apply_rope_with_cos_sin, bf16_to_f32_finite,
-    bitlinear_i8_rvv, compute_rope_cos_sin, dequantize_tensor_row, f16_to_f32_finite,
-    gqa_causal_attention_with_scratch_f32, relu_squared_gate_f32, subln_quantize_absmax_i8,
-    swiglu_f32,
+    BaselineKernel, QuantizedActQ8View, RopeType, VectorKernel, apply_rope_inplace,
+    apply_rope_with_cos_sin, bf16_to_f32_finite, bitlinear_i8_rvv, compute_rope_cos_sin,
+    dequantize_tensor_row, f16_to_f32_finite, gqa_causal_attention_with_scratch_f32,
+    relu_squared_gate_f32, subln_quantize_absmax_i8, swiglu_f32,
 };
 
 struct StackLayerKey {
@@ -1409,20 +1409,22 @@ impl BitNetRecipe {
         let rem = input.len();
         let saved_frm: usize;
         // SAFETY: `input` and `out_i8` share length `rem`; `input` contains finite `f32`s and
-        // `out_i8` is writable. Setting `frm = 4` (`RMM`, round-half-away-from-zero) before
-        // `vfcvt.x.f.v` matches `f32::round` after clamping into `[-128.0, 127.0]`, and narrowing
+        // `out_i8` is writable. `vfdiv.vf` runs under the caller's rounding mode (`RNE`), while
+        // `frm = 4` (`RMM`, round-half-away-from-zero) is active only around `vfcvt.x.f.v` to match
+        // `(val / scale).round()` after clamping into `[-128.0, 127.0]`. Narrowing
         // `e32,m4 -> e16,m2 -> e8,m1` preserves `VLMAX` across all three configs on `VLEN >= 128`.
-        // `frm` is restored before returning.
         unsafe {
             core::arch::asm!(
-                "csrrwi {saved_frm}, frm, 4",
+                "csrr {saved_frm}, frm",
                 "2:",
                 "vsetvli {vl}, {rem}, e32, m4, ta, ma",
                 "vle32.v v8, ({px})",
                 "vfdiv.vf v8, v8, {scale}",
                 "vfmax.vf v8, v8, {min_q}",
                 "vfmin.vf v8, v8, {max_q}",
+                "csrrwi zero, frm, 4",
                 "vfcvt.x.f.v v8, v8",
+                "csrw frm, {saved_frm}",
                 "vsetvli zero, {vl}, e16, m2, ta, ma",
                 "vnsra.wi v4, v8, 0",
                 "vsetvli zero, {vl}, e8, m1, ta, ma",
@@ -1433,7 +1435,6 @@ impl BitNetRecipe {
                 "add {po}, {po}, {vl}",
                 "sub {rem}, {rem}, {vl}",
                 "bnez {rem}, 2b",
-                "csrw frm, {saved_frm}",
                 px = inout(reg) ptr_x => _,
                 po = inout(reg) ptr_out => _,
                 rem = inout(reg) rem => _,
@@ -1855,9 +1856,20 @@ impl BitNetRecipe {
                 {
                     let _ = (total_rows, pool);
                     let row_buf = scope.alloc_f32_zeroed(hidden.len())?;
+                    let kernel = BaselineKernel::new();
+                    let chunk_half =
+                        matches!(head_weight.quant(), QuantType::F16 | QuantType::BF16);
                     for (r, slot) in logits.iter_mut().enumerate() {
                         dequantize_tensor_row(&head_weight, r, row_buf)?;
-                        *slot = row_buf.iter().zip(hidden).map(|(&w, &h)| w * h).sum();
+                        *slot = if chunk_half {
+                            let mut sum = 0.0_f32;
+                            for (w_chunk, h_chunk) in row_buf.chunks(256).zip(hidden.chunks(256)) {
+                                sum += kernel.dot_product_f32(w_chunk, h_chunk);
+                            }
+                            sum
+                        } else {
+                            kernel.dot_product_f32(row_buf, hidden)
+                        };
                     }
                     Ok(())
                 }
@@ -2732,5 +2744,101 @@ mod tests {
             .decode_step(&mut ctx, &weights)
             .expect("decode with exact tight scratch budget succeeds");
         assert_eq!(ctx.position(), 3);
+    }
+
+    #[test]
+    fn test_compact_lm_head_and_streaming_project_lm_head_bit_exact() {
+        struct SingleHeadWeight<'a> {
+            quant: QuantType,
+            shape: [usize; 2],
+            bytes: &'a [u8],
+        }
+        impl ModelWeights for SingleHeadWeight<'_> {
+            fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+                if name == "output.weight" {
+                    TensorView::from_bytes("output.weight", self.quant, &self.shape, 0, self.bytes)
+                } else {
+                    Err(missing_tensor_error(name))
+                }
+            }
+            fn tensor_count(&self) -> usize {
+                1
+            }
+            fn total_weight_bytes(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+
+        let rows = 12_usize;
+        for cols in [256_usize, 512_usize] {
+            let hidden: Vec<f32> = (0..cols)
+                .map(|c| {
+                    let phase = u16::try_from((c * 17) % 29).unwrap_or(0);
+                    f32::from(phase) * 0.0625 - 0.875
+                })
+                .collect();
+            for quant in [QuantType::F16, QuantType::BF16, QuantType::F32] {
+                let mut raw = Vec::new();
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let phase = u16::try_from((r * 7 + c * 11) % 31).unwrap_or(0);
+                        let val = (f32::from(phase) - 15.0) * 0.0625;
+                        match quant {
+                            QuantType::F16 => {
+                                let bits = val.to_bits();
+                                let sign = u16::try_from((bits >> 16) & 0x8000).unwrap_or(0);
+                                let exp =
+                                    i32::try_from((bits >> 23) & 0xff).unwrap_or(0) - 127 + 15;
+                                let mant = u16::try_from((bits >> 13) & 0x3ff).unwrap_or(0);
+                                let f16_bits = if exp <= 0 {
+                                    sign
+                                } else if exp >= 31 {
+                                    sign | 0x7c00
+                                } else {
+                                    sign | (u16::try_from(exp).unwrap_or(0) << 10) | mant
+                                };
+                                raw.extend_from_slice(&f16_bits.to_le_bytes());
+                            }
+                            QuantType::BF16 => {
+                                let bf16_bits = u16::try_from(val.to_bits() >> 16).unwrap_or(0);
+                                raw.extend_from_slice(&bf16_bits.to_le_bytes());
+                            }
+                            QuantType::F32 => raw.extend_from_slice(&val.to_le_bytes()),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                let shape = [cols, rows];
+                let view = TensorView::from_bytes("output.weight", quant, &shape, 0, &raw)
+                    .expect("head view");
+                let (compact, _) = crate::repack_cache::CompactLmHeadMatrix::from_tensor_counted(
+                    &view, rows, cols,
+                )
+                .expect("compact");
+                let mut cached_logits = vec![0.0_f32; rows];
+                compact
+                    .project_logits(&mut cached_logits, &hidden)
+                    .expect("compact project");
+
+                let recipe = BitNetRecipe::new_b158();
+                let weights = SingleHeadWeight {
+                    quant,
+                    shape,
+                    bytes: &raw,
+                };
+                let mut stream_logits = vec![0.0_f32; rows];
+                recipe
+                    .project_lm_head(&mut stream_logits, &hidden, None, &weights)
+                    .expect("streaming project");
+
+                for (r, (&a, &b)) in cached_logits.iter().zip(&stream_logits).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{quant:?} cols={cols} row={r}: cached {a} != stream {b}"
+                    );
+                }
+            }
+        }
     }
 }
